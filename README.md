@@ -30,7 +30,7 @@ Task folders are created by `/devproc:start` under `<dir>/.claude/devproc/tasks/
 ## Install, upgrade, remove
 
 ```bash
-git clone https://github.com/AnapatAut/Claude_Procedure.git devproc && cd devproc
+git clone https://github.com/AnapatAut/Claude-Procedure.git devproc && cd devproc
 ```
 
 Run the commands below from that folder. Every command is a dry run unless `--apply` is given. Each user runs it as themselves.
