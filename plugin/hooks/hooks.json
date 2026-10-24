@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|mcp__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -I \"${CLAUDE_PLUGIN_ROOT}/scripts/guard.py\"",
+            "timeout": 150,
+            "statusMessage": "devproc guard"
+          }
+        ]
+      }
+    ]
+  }
+}

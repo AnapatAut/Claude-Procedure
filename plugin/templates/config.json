@@ -1,0 +1,10 @@
+{
+  "commands": {
+    "typecheck": "",
+    "test": "",
+    "lint": "",
+    "build": ""
+  },
+  "leakPatterns": {},
+  "leakIgnorePaths": []
+}

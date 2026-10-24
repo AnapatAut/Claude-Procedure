@@ -1,0 +1,14 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "devproc",
+  "description": "Local marketplace for the devproc general dev procedure.",
+  "owner": { "name": "AnapatAut" },
+  "plugins": [
+    {
+      "name": "devproc",
+      "description": "General dev procedure: push and DB guards, leak scan, and skills for baseline, verify, decisions, mistakes, presentation and close.",
+      "source": "./plugin",
+      "category": "productivity"
+    }
+  ]
+}

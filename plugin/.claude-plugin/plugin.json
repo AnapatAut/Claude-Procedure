@@ -1,0 +1,10 @@
+{
+  "name": "devproc",
+  "version": "0.2.0",
+  "description": "General dev procedure: push and DB guards, leak scan, and skills for baseline, verify, decisions, mistakes, presentation and close.",
+  "author": {
+    "name": "AnapatAut"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/AnapatAut/Claude_Procedure"
+}
