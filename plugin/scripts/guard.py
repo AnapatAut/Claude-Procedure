@@ -30,7 +30,7 @@ import shlex
 import subprocess
 import sys
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 MAX_DIFF_BYTES = 20 * 1024 * 1024
 MAX_FILE_BYTES = 1024 * 1024
 MAX_REPORT = 10

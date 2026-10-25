@@ -5,7 +5,7 @@ A general dev procedure (`docs/PROCEDURE.md`) packaged as Claude Code config, in
 - Docs for deciding whether to adopt it: `docs/01-why-and-what.md`, `docs/02-how-it-works.md`, `docs/03-adopting.md`.
 - Design and research: `DESIGN.md`.
 
-Requirements: `python3` 3.8 or later, `git`, and the Claude Code CLI. Tested on Linux with Claude Code 2.1.306 and git 2.43. macOS is untested; Windows is not supported.
+Requirements: `python3` 3.8 or later, `git`, and the Claude Code CLI. Tested on Linux with Claude Code 2.1.310 and git 2.43. macOS is untested; Windows is not supported.
 
 ## What a project gets
 
@@ -14,7 +14,7 @@ Requirements: `python3` 3.8 or later, `git`, and the Claude Code CLI. Tested on 
 | Rules (4 files, about 40 lines) | `<dir>/.claude/rules/devproc/` | always-on procedure: precedence, modes and stop list, git and DB safety, baseline / verify / mistakes / decisions. Project-owned: edit freely. |
 | Config | `<dir>/.claude/devproc/config.json` | typecheck / test / lint / build commands, extra leak patterns, ignored paths |
 | Mistakes ledger | `<dir>/.claude/devproc/MISTAKES.md` | rules, ledger, recurrence ladder |
-| Plugin `devproc@devproc` (local scope) | enabled in `<dir>/.claude/settings.local.json` | hook + skills + reviewer agent, for this directory only |
+| Plugin `devproc@devproc-<id>` (local scope) | read-only snapshot `<dir>/.claude/devproc/dist/<version>/`, enabled in `<dir>/.claude/settings.local.json` | hook + skills + reviewer agent, for this directory only. Sessions load this snapshot, never the clone |
 | Hook (PreToolUse) | plugin | see below |
 | Skills | plugin | `/devproc:start`, `baseline`, `verify`, `decision`, `mistake`, `present`, `close` |
 | Agent | plugin | `devproc-reviewer`: fresh-context review, read-only by instruction (it has Bash) |
@@ -38,16 +38,20 @@ Run the commands below from that folder. Every command is a dry run unless `--ap
 ```bash
 ./install.sh <dir>                    # show the plan
 ./install.sh --apply <dir>            # install
-./install.sh --status <dir>           # state of each file (as seeded / evolved / missing / adopted)
-./install.sh --upgrade --apply <dir>  # update files still as seeded + the plugin; keeps evolved files
+./install.sh --status <dir>           # state of each file, and a health check of the install (exit 0 ok, 1 not installed, 4 problems)
+./install.sh --upgrade --apply <dir>  # move this directory to the clone's version; keeps evolved files
+./install.sh --repair --apply <dir>   # restore a damaged, moved or copied install at the same version
 ./uninstall.sh --apply <dir>          # remove what devproc put there and the project did not change
 ```
 
 - `<dir>` in a git repo must be the **top level of the main checkout**: Claude Code keeps local plugin settings there. A subdirectory or a linked worktree is refused, and the message names the right directory.
 - Restart Claude Code sessions in `<dir>` after install or upgrade.
-- An installed directory runs a **copy** of the plugin from Claude Code's cache (`~/.claude/plugins/cache/devproc/devproc/<version>/`), not this folder. A change to the source reaches a directory only after the `version` in `plugin/.claude-plugin/plugin.json` is raised and `install.sh --upgrade --apply <dir>` is run.
+- Each installed directory runs **its own read-only snapshot** of the plugin, `<dir>/.claude/devproc/dist/<version>/`, registered as a marketplace of its own (`devproc-<id>`). Editing or pulling the clone changes no installed directory, and directories can be on different versions.
+- **A version's code never changes.** After any change under `plugin/`, raise `version` in `plugin/.claude-plugin/plugin.json`, then run `install.sh --upgrade --apply <dir>` per directory. An upgrade from a changed source with the same version is refused.
+- Moved or copied a project folder? `--status` reports it and `--repair` fixes it (or `--upgrade`, when the source is at a newer version: it fixes the same problems). The folder gets a marketplace named for its new place; the original is not touched. Until the repair, a session in a moved folder runs without devproc, and a session in a copy loads the original's snapshot.
+- devproc 0.2.0 ran the plugin live from the clone in every directory (its docs wrongly said it ran a cached copy). `--upgrade` moves a 0.2.0 directory to its own snapshot.
 - **Install only with `install.sh`.** Do not add this repo with `/plugin marketplace add`: that gives the hook and skills without the rules and config, and possibly at user scope, so in every project.
-- Keep the clone where it is while directories use it: the plugin registry and each manifest record its path. To move it, uninstall from those directories, move it, then install again.
+- Installed directories do not use the clone, so it can be moved or deleted. Run `--upgrade` and `--repair` from a clone at the version you want.
 
 ## Adapting it
 
@@ -74,20 +78,24 @@ Run the commands below from that folder. Every command is a dry run unless `--ap
 
 ## Safety
 
-- Writes only inside `<dir>/.claude/`, the repo's local `.git/info/exclude` (never committed), and Claude Code's plugin registry through the `claude plugin` CLI. Never edits `~/.claude/settings.json`. No sudo. devproc itself makes no network calls.
+- Writes only inside `<dir>/.claude/`, the repo's local `.git/info/exclude` (never committed), and Claude Code's plugin registry through the `claude plugin` CLI. Claude Code also keeps a cache copy, which sessions do not load; after uninstall it marks that copy orphaned and deletes it 14 days later. Never edits `~/.claude/settings.json`. (Where Claude Code never ran, the `claude` CLI itself creates its config files on first use.) No sudo. devproc itself makes no network calls.
 - **Never replaces a file it did not write**, or one changed since it wrote it. A file already identical to a template is recorded as the project's own and is never updated or removed. In `settings.local.json` and the exclude file it only adds and removes its own entries. A second install changes nothing.
 - **Preflight, before writing anything:**
   - the guard self-test passes, and fails on a do-nothing mutant guard;
   - `claude plugin validate` passes for the plugin and the marketplace.
-- **Install and upgrade roll back** every completed step when a step fails. That includes restoring files an upgrade replaced and removing the directories install created.
-  - Exception: the `claude plugin update` step of an upgrade is not undone; rerun the upgrade.
+- **Install, upgrade and repair roll back** when a step fails or the run is interrupted: the failed step's own partial work, then every completed step. Files an upgrade replaced are restored, new snapshots and created directories removed, the marketplace removed or pointed back, the plugin uninstalled, updated back or re-installed, and `settings.local.json` restored to its exact bytes (removed if it did not exist before the run).
+  - After the first interrupt, later ones are ignored until the rollback ends, and a running `claude` or `git` call is let finish first.
+  - Once the work is done and checked, the last steps only tidy up (old snapshots, old records). An interrupt there keeps the work and lists the tidying steps not done (or not confirmed done).
   - A failed undo is reported as `rollback INCOMPLETE`.
+- **One run at a time** per directory: `--apply` locks the directory; a second run is refused. Each `claude` CLI call times out after 300 s (set `DEVPROC_CLI_TIMEOUT` to change it); a call that hangs is killed with what it started.
+- **Exit codes:** 0 done; 1 refused, or failed and rolled back; 2 usage; 3 rollback incomplete, uninstall stopped, or unexpected error; 4 `--status` found problems.
+- **Refused before writing anything:** a symlink at a devproc folder or file (writes would follow it out of the directory; uninstall and status refuse it too when a manifest is found through it, since that is another directory's install), a tracked `settings.local.json`, a worktree whose main checkout git cannot name (bare or `--separate-git-dir` repository), and any git error other than "not a git repository" (for example a repo owned by another user).
 - **Uninstall does not roll back.** On a failure it stops, says how many steps were done, and can be rerun to finish.
 - **Uninstall removes only:**
   - seeded files unchanged since install;
-  - devproc's marketplace entry for this directory (the shared registry entry stays while other directories use it);
-  - the exclude lines for paths left empty;
-  - `settings.local.json` if devproc created it and it is now empty;
+  - this directory's marketplace (which also removes its plugin records) and its plugin snapshots. In a copy never repaired, the original's marketplace stays and only the copy's own records are removed;
+  - the exclude lines for paths left empty, in this directory's own exclude file, and the `settings.local.json` line when that file existed before install (it goes back to how it was);
+  - its own entries in `settings.local.json`: a file that existed before goes back to its exact bytes if the project did not change it; a file devproc created is removed if it is now empty;
   - directories devproc created and left empty.
 
   It lists every file it keeps, and keeps the exclude lines for kept task data so evidence is not committed by accident.
@@ -111,5 +119,6 @@ Run the commands below from that folder. Every command is a dry run unless `--ap
 ```bash
 python3 -I tests/selftest.py plugin/scripts/guard.py   # guard: 91 cases, exit 0
 python3 -I tests/selftest.py tests/mutant_noop.py      # must exit 1
-tests/installer-e2e.sh                                 # sandbox CLAUDE_CONFIG_DIR + throwaway dirs, 70 checks
+tests/installer-e2e.sh                                 # sandbox CLAUDE_CONFIG_DIR + throwaway dirs, 331 checks (needs the v0.2.0 tag, or OLD_SRC)
+tests/installer-mutants.py -j 4                        # 78 mutants, each caught by its own check (about 2 h)
 ```

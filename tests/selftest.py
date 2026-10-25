@@ -20,6 +20,12 @@ GUARD = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else None
 ENV = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
            GIT_COMMITTER_EMAIL="t@t", GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
 ENV.pop("CLAUDE_PROJECT_DIR", None)
+# a caller's variables naming a repository (a git hook, vcsh, yadm) would point every git call
+# here at that repository
+for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
+          "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_GRAFT_FILE",
+          "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX", "GIT_SHALLOW_FILE", "GIT_CONFIG"):
+    ENV.pop(k, None)
 # planted values are built at run time so this file holds no literal secret
 FAKE_KEY = "AKIA" + "Q" * 16
 FAKE_PRIVATE = "-----BEGIN " + "RSA PRIVATE KEY-----"

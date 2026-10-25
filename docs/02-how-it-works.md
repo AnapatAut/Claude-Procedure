@@ -42,10 +42,11 @@ Two more skills cover the rest of the procedure:
     devproc/
       config.json         commands, leak patterns, ignored paths
       MISTAKES.md         rules, ledger, ladder
-      manifest.json       what devproc installed, with hashes (used by upgrade and uninstall)
+      manifest.json       what devproc installed, with hashes (used by status, upgrade, repair, uninstall)
+      dist/<version>/     read-only plugin snapshot: what Claude Code loads in this directory
       CURRENT             name of the active task folder
       tasks/<date>-<slug>/ TASK.md  DECISIONS.md  run/
-    settings.local.json   enables the plugin for this directory only
+    settings.local.json   registers the snapshot as this directory's marketplace and enables the plugin, for this directory only
 ```
 
 In a git repo, devproc must be installed at the top level of the main checkout, and these paths go into `.git/info/exclude`, which is local and never committed. Nothing is committed by accident, also after uninstall: the exclude lines stay while task data stays.
@@ -53,10 +54,10 @@ In a git repo, devproc must be installed at the top level of the main checkout, 
 To share the rules with a team:
 - in `.git/info/exclude`, delete the `/.claude/rules/devproc/` line and the `# devproc: …` line above it, then commit that folder;
 - add the config with `git add -f .claude/devproc/config.json`. Its `leakPatterns` then become readable by everyone with the repo: in a public repo, keep internal host names out of it;
-- keep the `/.claude/devproc/` line: that folder also holds `manifest.json` (with the absolute path of the devproc source), `CURRENT` and task evidence.
+- keep the `/.claude/devproc/` line: that folder also holds `manifest.json` (with the absolute path of the devproc source), the plugin snapshot, `CURRENT` and task evidence.
 
 After that:
-- an uninstall deletes the committed rule files that are still as seeded, and git shows them as deleted;
+- an uninstall deletes the committed rule files and `config.json` that are still as seeded, and git shows them as deleted;
 - a teammate who runs `install.sh` gets the exclude line added again in their clone. Tracked files stay tracked, but a new rule file they create is hidden from `git status` until they add it with `git add -f`;
 - committed rule files identical to the templates count as the project's own in a teammate's install, so upgrades never change them. Update them by hand and commit.
 
