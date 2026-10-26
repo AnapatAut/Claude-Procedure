@@ -68,7 +68,7 @@ After that:
 | `00-precedence.md` | which document wins on a conflict; facts come from commands, not memory; evidence lives in `run/`; a check must be proven able to fail |
 | `10-modes.md` | step-gated by default; autonomous runs only under a written mandate; the 7-item stop list; the presentation format |
 | `20-safety.md` | push only on a go; staged paths explicit; DB read-only by default; protection only grows (no deleting tests to go green) |
-| `30-work.md` | baseline before the edit; differences need a DECISIONS row; the re-verify list; the mistake ladder; how decisions are recorded |
+| `30-work.md` | baseline before the edit; differences need a DECISIONS row; the re-verify list; the mistake ladder; how decisions are recorded; browsers: each session its own, closed when done |
 
 The project owns these files. Edit them as its procedure evolves. Upgrades never overwrite a file the project has changed.
 

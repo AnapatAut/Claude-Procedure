@@ -83,14 +83,14 @@ Run the commands below from that folder. Every command is a dry run unless `--ap
 - **Preflight, before writing anything:**
   - the guard self-test passes, and fails on a do-nothing mutant guard;
   - `claude plugin validate` passes for the plugin and the marketplace.
-- **Install, upgrade and repair roll back** when a step fails or the run is interrupted: the failed step's own partial work, then every completed step. Files an upgrade replaced are restored, new snapshots and created directories removed, the marketplace removed or pointed back, the plugin uninstalled, updated back or re-installed, and `settings.local.json` restored to its exact bytes (removed if it did not exist before the run).
-  - After the first interrupt, later ones are ignored until the rollback ends, and a running `claude` or `git` call is let finish first.
-  - Once the work is done and checked, the last steps only tidy up (old snapshots, old records). An interrupt there keeps the work and lists the tidying steps not done (or not confirmed done).
-  - A failed undo is reported as `rollback INCOMPLETE`.
-- **One run at a time** per directory: `--apply` locks the directory; a second run is refused. Each `claude` CLI call times out after 300 s (set `DEVPROC_CLI_TIMEOUT` to change it); a call that hangs is killed with what it started.
-- **Exit codes:** 0 done; 1 refused, or failed and rolled back; 2 usage; 3 rollback incomplete, uninstall stopped, or unexpected error; 4 `--status` found problems.
+- **No rollback, as dpkg.** The first step of every install, upgrade, repair and uninstall writes the manifest, marked pending, with everything the run will do (the original bytes of `settings.local.json` included). A failed step, an interrupt or a kill (SIGKILL, power loss) stops the run part-way. Rerunning the same command finishes it; uninstall removes it from any state. `--status` reports a run that did not finish.
+  - Every file write is atomic (temp file, fsync, rename, fsync of the folder): a kill or a power cut leaves a file's old bytes or its new ones, never a cut file.
+  - The first Ctrl-C, SIGTERM or SIGHUP stops the run after the current step; a second stops it at once. A running `claude` call is never killed by an interrupt: it finishes by itself. Under `nohup`, SIGHUP is ignored and the run goes on.
+  - Once the work is done and checked, the last steps only tidy up (old snapshots, old records). A failure or an interrupt there keeps the work and lists the tidying steps not done.
+- **One run at a time** per directory: `--apply` locks the directory; a second run is refused. Runs in different directories queue (up to 300 s) on Claude Code's plugin registry, which they share. Each `claude` CLI call times out after 300 s (set `DEVPROC_CLI_TIMEOUT` to change it); a call that hangs is killed with what it started.
+- **Exit codes:** 0 done; 1 refused, nothing changed; 2 usage; 3 stopped part-way (rerun the same command to finish, or uninstall); 4 `--status` found problems.
 - **Refused before writing anything:** a symlink at a devproc folder or file (writes would follow it out of the directory; uninstall and status refuse it too when a manifest is found through it, since that is another directory's install), a tracked `settings.local.json`, a worktree whose main checkout git cannot name (bare or `--separate-git-dir` repository), and any git error other than "not a git repository" (for example a repo owned by another user).
-- **Uninstall does not roll back.** On a failure it stops, says how many steps were done, and can be rerun to finish.
+- **Uninstall works from any state with a manifest**, an install that did not finish included. On a failure it stops, says how many steps were done, and a rerun finishes it. While an uninstall is unfinished, install refuses.
 - **Uninstall removes only:**
   - seeded files unchanged since install;
   - this directory's marketplace (which also removes its plugin records) and its plugin snapshots. In a copy never repaired, the original's marketplace stays and only the copy's own records are removed;
@@ -119,6 +119,7 @@ Run the commands below from that folder. Every command is a dry run unless `--ap
 ```bash
 python3 -I tests/selftest.py plugin/scripts/guard.py   # guard: 91 cases, exit 0
 python3 -I tests/selftest.py tests/mutant_noop.py      # must exit 1
-tests/installer-e2e.sh                                 # sandbox CLAUDE_CONFIG_DIR + throwaway dirs, 331 checks (needs the v0.2.0 tag, or OLD_SRC)
-tests/installer-mutants.py -j 4                        # 78 mutants, each caught by its own check (about 2 h)
+tests/installer-e2e.sh                                 # sandbox CLAUDE_CONFIG_DIR + throwaway dirs, 440 checks (needs the v0.2.0 tag, or OLD_SRC)
+tests/installer-killsweep.sh                           # SIGKILL before every step of install, upgrade, uninstall: 190 checks
+tests/installer-mutants.py -j 4                        # 106 mutants, each caught by its own check (hours)
 ```

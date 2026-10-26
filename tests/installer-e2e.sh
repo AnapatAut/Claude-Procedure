@@ -84,6 +84,11 @@ same_steps() { local d a; d="$(steps_done "$1")"; a="$(steps_done "$2")"; [ -n "
 lacks() { [ -f "$1" ] && ! grep -q -- "$2" "$1"; }
 writable_in() { find "$1" -perm -u=w -print -quit; }
 status_rc() { set +e; inst --status "$1" > "$T/status.log" 2>&1; local rc=$?; set -e; echo "$rc"; }
+# run "$@" (an applied run), output to $1: it must stop part-way, exit 3, saying a rerun finishes it
+stops() { local log="$1" rc; shift; set +e; "$@" > "$log" 2>&1; rc=$?; set -e; [ "$rc" = 3 ] && grep -q "safe to rerun" "$log"; }
+wait_for() { for _ in $(seq 600); do [ -e "$1" ] && return 0; sleep 0.2; done; return 1; }
+# number of the first step in a plan (on stdin) whose description matches the ERE $1
+step_of() { grep -oE "\[[0-9]+/[0-9]+\] $1" | head -1 | sed 's/^\[\([0-9]*\)\/.*/\1/'; }
 
 # ---- targets
 P1="$T/p1"; mkdir -p "$P1"; git -C "$P1" init -q
@@ -184,32 +189,33 @@ mkdir -p "$T/noclaude"; ln -s "$(command -v git)" "$T/noclaude/git"
 set +e; PATH="$T/noclaude" "$(command -v python3)" -I "$SRC/lib/devproc_install.py" status "$P2" > "$T/noclaude.log" 2>&1; rc=$?; set -e
 check "claude missing: clean message, exit 1" test "$rc" = 1 -a -n "$(grep 'claude. not found on PATH' "$T/noclaude.log")"
 
-echo "== rollback: plugin install fails half way"
+echo "== a failed step stops the run (no rollback); uninstall then removes what it did"
 P4="$T/p4"; mkdir -p "$P4"; git -C "$P4" init -q
+before="$(state "$P4")"
 fake_fail plugin install
-PATH="$T/fakebin:$PATH" "$SRC/install.sh" --apply "$P4" > "$T/rb.log" 2>&1 && bad "rollback: install should fail" || true
-check "rollback: reported" grep -q "rolled back" "$T/rb.log"
-check "rollback: no rules left" test ! -e "$P4/.claude/rules/devproc/00-precedence.md"
-check "rollback: no manifest" test ! -e "$P4/.claude/devproc/manifest.json"
-check "rollback: exclude restored" lacks "$P4/.git/info/exclude" "added by devproc"
-check "rollback: marketplace removed" bash -c "! grep -q devproc '$P4/.claude/settings.local.json' 2>/dev/null"
-check "rollback: no settings.local.json left" test ! -e "$P4/.claude/settings.local.json"
-check "rollback: no .claude dir left" test ! -e "$P4/.claude"
-check "rollback: marketplace not registered" reg_lacks "$(mname "$P4")"
-check "rollback: exit 1" test "$(set +e; PATH="$T/fakebin:$PATH" "$SRC/install.sh" --apply "$P4" >/dev/null 2>&1; echo $?)" = 1
+check "failed step: exit 3, says a rerun finishes it" stops "$T/rb.log" env PATH="$T/fakebin:$PATH" "$SRC/install.sh" --apply "$P4"
+check "failed step: names the step that failed" grep -qF 'FAILED: `claude plugin install' "$T/rb.log"
+check "failed step: no rollback claimed" lacks "$T/rb.log" "rolled back"
+check "failed step: the manifest says the install is pending" test "$(mf "$P4" pending)" = install
+check "failed step: status reports the unfinished run (exit 4)" test "$(status_rc "$P4")" = 4 -a -n "$(grep 'did not finish' "$T/status.log")"
+uninst --apply "$P4" > "$T/rbu.log" 2>&1 || { cat "$T/rbu.log"; bad "p4 uninstall after the failed install"; }
+check "failed step, then uninstall: directory and registry as before" test "$before" = "$(state "$P4")"
 
-echo "== rollback: marketplace add does its work, then fails (the failed step itself is undone)"
+echo "== a step does its work, then fails: a rerun finishes the run"
 fake_fail after plugin marketplace add
-PATH="$T/fakebin:$PATH" "$SRC/install.sh" --apply "$P4" > "$T/rba.log" 2>&1 && bad "partial step: install should fail" || true
-check "partial step: rollback complete" grep -q "nothing from this run is left" "$T/rba.log"
-check "partial step: marketplace not left registered" reg_lacks "$(mname "$P4")"
-check "partial step: nothing left in the directory" test ! -e "$P4/.claude"
+check "partial step: exit 3" stops "$T/rba.log" env PATH="$T/fakebin:$PATH" "$SRC/install.sh" --apply "$P4"
+inst --apply "$P4" > "$T/rba2.log" 2>&1 || { cat "$T/rba2.log"; bad "partial step: rerun exit"; }
+check "partial step, rerun: says it finishes the earlier run" grep -q "did not finish in .*: finishing it" "$T/rba2.log"
+check "partial step, rerun: healthy, no longer pending" test "$(status_rc "$P4")" = 0 -a -z "$(grep pending "$P4/.claude/devproc/manifest.json")"
+uninst --apply "$P4" > /dev/null || bad "p4 uninstall exit"
+check "partial step, rerun, uninstall: directory and registry as before" test "$before" = "$(state "$P4")"
 
-echo "== rollback: the snapshot fails validation half way (its own partial copy is removed)"
+echo "== the snapshot fails validation half way: no partial copy is left"
 fake_fail plugin validate "$P4/.claude/devproc/dist"
-PATH="$T/fakebin:$PATH" "$SRC/install.sh" --apply "$P4" > "$T/rbv.log" 2>&1 && bad "snapshot rollback: install should fail" || true
-check "snapshot rollback: complete" grep -q "nothing from this run is left" "$T/rbv.log"
-check "snapshot rollback: no .partial copy left" test ! -e "$P4/.claude"
+check "snapshot failure: exit 3" stops "$T/rbv.log" env PATH="$T/fakebin:$PATH" "$SRC/install.sh" --apply "$P4"
+check "snapshot failure: no .partial copy, no snapshot under the real name" test -z "$(find "$P4/.claude/devproc/dist" -mindepth 1)"
+uninst --apply "$P4" > /dev/null || bad "p4 uninstall exit"
+check "snapshot failure, then uninstall: directory and registry as before" test "$before" = "$(state "$P4")"
 
 echo "== two directories: removing one leaves the other working"
 P5="$T/p5"; P6="$T/p6"; mkdir -p "$P5" "$P6"; git -C "$P5" init -q; git -C "$P6" init -q
@@ -233,18 +239,28 @@ check "after upgrade: loads the 9.9.9 snapshot" test "$ip2" = "$P6/.claude/devpr
 check "after upgrade: loaded copy has the change" grep -q e2e-marker "$ip2/scripts/guard.py"
 check "after upgrade: manifest version 9.9.9" grep -q '"version": "9.9.9"' "$P6/.claude/devproc/manifest.json"
 check "after upgrade: previous snapshot kept for running sessions" test -d "$ip"
-echo "== upgrade rollback: plugin update fails after a rule was updated"
+echo "== upgrade stops at a failed step after a rule was updated; a rerun finishes it"
 echo "- new template line" >> "$SRC/plugin/templates/rules/20-safety.md"
 setver 9.9.10
-rule_before="$(sha256sum < "$P6/.claude/rules/devproc/20-safety.md")"; man_before="$(sha256sum < "$P6/.claude/devproc/manifest.json")"
 fake_fail once plugin update
-PATH="$T/fakebin:$PATH" "$SRC/install.sh" --upgrade --apply "$P6" > "$T/uprb.log" 2>&1 && bad "upgrade rollback: should fail" || true
-check "upgrade rollback: reported" grep -q "rolled back; nothing from this run is left" "$T/uprb.log"
-check "upgrade rollback: rule restored, not deleted" test "$rule_before" = "$(sha256sum < "$P6/.claude/rules/devproc/20-safety.md")"
-check "upgrade rollback: manifest unchanged" test "$man_before" = "$(sha256sum < "$P6/.claude/devproc/manifest.json")"
-check "upgrade rollback: still loads 9.9.9" test "$(loaded "$P6")" = "$P6/.claude/devproc/dist/9.9.9/plugin"
-check "upgrade rollback: new snapshot removed" test ! -e "$P6/.claude/devproc/dist/9.9.10"
-check "upgrade rollback: status healthy (exit 0)" test "$(status_rc "$P6")" = 0
+check "upgrade stopped: exit 3" stops "$T/uprb.log" env PATH="$T/fakebin:$PATH" "$SRC/install.sh" --upgrade --apply "$P6"
+check "upgrade stopped: the manifest says the upgrade is pending" test "$(mf "$P6" pending)" = "upgrade to 9.9.10"
+check "upgrade stopped: status exit 4; the rule it updated counts as devproc's, not the project's" test "$(status_rc "$P6")" = 4 -a -n "$(grep '20-safety.md *as seeded' "$T/status.log")"
+PATH="$T/fakebin:$PATH" "$SRC/install.sh" --upgrade --apply "$P6" > "$T/uprb2.log" 2>&1 || { cat "$T/uprb2.log"; bad "upgrade rerun exit"; }
+check "upgrade rerun: healthy, loads 9.9.10" test "$(status_rc "$P6")" = 0 -a "$(loaded "$P6")" = "$P6/.claude/devproc/dist/9.9.10/plugin"
+check "upgrade rerun: the rule has the new template line" grep -q "new template line" "$P6/.claude/rules/devproc/20-safety.md"
+check "upgrade rerun: 9.9.9 kept as the previous snapshot" test -d "$P6/.claude/devproc/dist/9.9.9/plugin"
+check "upgrade rerun: the snapshot older than the previous one removed" test ! -e "$ip"
+echo "== upgrade killed before it updates a rule: the rule still counts as devproc's; a rerun updates it"
+cp "$SRC/plugin/templates/rules/20-safety.md" "$T/20-safety.saved"
+echo "- newest template line" >> "$SRC/plugin/templates/rules/20-safety.md"; setver 9.9.11
+k="$(inst --upgrade "$P6" | step_of 'copy .*20-safety.md')"
+set +e; DEVPROC_FAILPOINT="step:$k" inst --upgrade --apply "$P6" > "$T/k6.log" 2>&1; rc=$?; set -e
+check "upgrade killed before a rule update: killed (exit 137)" test -n "$k" -a "$rc" = 137
+check "upgrade killed before a rule update: the rule still counts as devproc's (as seeded)" test "$(status_rc "$P6")" = 4 -a -n "$(grep '20-safety.md *as seeded' "$T/status.log")"
+inst --upgrade --apply "$P6" > "$T/k6r.log" 2>&1 || { cat "$T/k6r.log"; bad "p6 upgrade rerun after the kill"; }
+check "upgrade killed before a rule update: a rerun updates the rule" grep -q "newest template line" "$P6/.claude/rules/devproc/20-safety.md"
+cp "$T/20-safety.saved" "$SRC/plugin/templates/rules/20-safety.md"; setver 9.9.10
 
 echo "== uninstall stops on failure and a rerun finishes it"
 fake_fail plugin marketplace remove
@@ -258,15 +274,16 @@ check "p6: no exclude lines left (nothing kept)" lacks "$P6/.git/info/exclude" "
 check "p6: plugin gone from list" list_lacks_dir "$P6"
 check "p6: directory empty again (only .git)" test "$(ls -A "$P6")" = ".git"
 
-echo "== rollback while another directory is installed leaves it working"
+echo "== a failed install in one directory leaves another working"
 P8="$T/p8"; P9="$T/p9"; mkdir -p "$P8" "$P9"; git -C "$P8" init -q; git -C "$P9" init -q
 inst --apply "$P8" > "$T/i8.log" || { cat "$T/i8.log"; bad "p8 install exit"; }
 fake_fail plugin install
-PATH="$T/fakebin:$PATH" "$SRC/install.sh" --apply "$P9" > "$T/rb9.log" 2>&1 && bad "p9: install should fail" || true
-check "p9 rollback: complete" grep -q "nothing from this run is left" "$T/rb9.log"
-check "p8: still loads its snapshot after p9 rollback" test "$(loaded "$P8")" = "$P8/.claude/devproc/dist/9.9.10/plugin"
+check "p9: stopped (exit 3)" stops "$T/rb9.log" env PATH="$T/fakebin:$PATH" "$SRC/install.sh" --apply "$P9"
+check "p8: still loads its snapshot after p9's failed install" test "$(loaded "$P8")" = "$P8/.claude/devproc/dist/9.9.10/plugin"
 check "p8: marketplace still registered" reg_has "$(mf "$P8" marketplace)"
 check "p8: status healthy" test "$(status_rc "$P8")" = 0
+uninst --apply "$P9" > "$T/u9.log" || { cat "$T/u9.log"; bad "p9 uninstall exit"; }
+check "p8: still healthy after p9's uninstall" test "$(status_rc "$P8")" = 0
 uninst --apply "$P8" > "$T/u8.log"
 
 echo "== per-directory snapshots: what a session loads"
@@ -376,11 +393,9 @@ P13ID="$(mf "$P13M" pluginId)"
 check "copy: status exit 4" test "$(status_rc "$P13C")" = 4
 check "copy: before repair, a session there loads the ORIGINAL's snapshot" test "$(session_hooks "$P13C")" = "$P13M/.claude/devproc/dist/9.9.20/plugin/hooks/hooks.json"
 check "copy: that session left a record for the copy" has_rec "$P13ID" "$P13C"
-before="$(state "$P13C")"
 fake_fail after plugin install "devproc@$(mname "$P13C")"
-PATH="$T/fakebin:$PATH" "$SRC/install.sh" --repair --apply "$P13C" > "$T/cprb.log" 2>&1 && bad "copy repair rollback: should fail" || true
-check "copy repair rollback: complete" grep -q "rolled back; nothing from this run is left" "$T/cprb.log"
-check "copy repair rollback: directory and registry as before (the copy's old record included)" test "$before" = "$(state "$P13C")"
+check "copy repair stopped: exit 3" stops "$T/cprb.log" env PATH="$T/fakebin:$PATH" "$SRC/install.sh" --repair --apply "$P13C"
+check "copy repair stopped: the manifest says the repair is pending" test "$(mf "$P13C" pending)" = repair
 inst --repair --apply "$P13C" > "$T/cp.log" || { cat "$T/cp.log"; bad "copy: repair exit"; }
 check "copy: gets its own marketplace" test "$(mf "$P13C" marketplace)" != "$(mf "$P13M" marketplace)"
 check "copy: its record of the original's plugin removed" lacks_rec "$P13ID" "$P13C"
@@ -391,6 +406,16 @@ check "original: still healthy after the copy's repair" test "$(status_rc "$P13M
 check "original: still loads its own snapshot" test "$(loaded "$P13M")" = "$P13M/.claude/devproc/dist/9.9.20/plugin"
 uninst --apply "$P13C" > "$T/ucp.log" || { cat "$T/ucp.log"; bad "copy: uninstall exit"; }
 check "original: healthy after the copy's uninstall" test "$(status_rc "$P13M")" = 0
+echo "-- copied project, its repair stopped before it left the original's records: uninstall removes the copy's own"
+P13D="$T/p13copy2"; cp -a "$P13M" "$P13D"
+session_hooks "$P13D" > /dev/null || true
+check "copy 2: a session there left a record for the copy" has_rec "$P13ID" "$P13D"
+fake_fail plugin uninstall "$P13ID"
+check "copy 2 repair stopped: exit 3" stops "$T/cp2.log" env PATH="$T/fakebin:$PATH" "$SRC/install.sh" --repair --apply "$P13D"
+uninst --apply "$P13D" > "$T/ucp2.log" || { cat "$T/ucp2.log"; bad "copy 2: uninstall exit"; }
+check "copy 2, stopped repair, then uninstall: the copy's records removed" no_recs_at "$P13D"
+check "copy 2, stopped repair, then uninstall: copy empty again (only .git)" test "$(ls -A "$P13D")" = ".git"
+check "copy 2: the original still healthy" test "$(status_rc "$P13M")" = 0
 echo "-- copied project, never repaired: its uninstall leaves the original alone"
 P13U="$T/p13unrepaired"; cp -a "$P13M" "$P13U"
 ex13="$(sha256sum < "$P13M/.git/info/exclude")"
@@ -421,11 +446,8 @@ P13X="$T/p13hijack"; cp -a "$P13M" "$P13X"
 (cd "$P13X" && claude plugin marketplace add "$P13X/.claude/devproc/dist/9.9.20" --scope local) > /dev/null 2>&1
 check "hijacked: status exit 4" test "$(status_rc "$P13M")" = 4
 check "hijacked: status says it points elsewhere" grep -q "points at $P13X" "$T/status.log"
-before="$(state "$P13M")"
 fake_fail after plugin marketplace add "$P13M"
-PATH="$T/fakebin:$PATH" "$SRC/install.sh" --repair --apply "$P13M" > "$T/hjrb.log" 2>&1 && bad "hijack repair rollback: should fail" || true
-check "hijack repair rollback: complete" grep -q "rolled back; nothing from this run is left" "$T/hjrb.log"
-check "hijack repair rollback: registry points at the other folder again, as before" test "$before" = "$(state "$P13M")"
+check "hijack repair stopped: exit 3" stops "$T/hjrb.log" env PATH="$T/fakebin:$PATH" "$SRC/install.sh" --repair --apply "$P13M"
 inst --repair --apply "$P13M" > "$T/hj.log" || { cat "$T/hj.log"; bad "hijacked: repair exit"; }
 check "hijacked: repaired, loads its own snapshot again" test "$(loaded "$P13M")" = "$P13M/.claude/devproc/dist/9.9.20/plugin"
 check "hijacked: status healthy" test "$(status_rc "$P13M")" = 0
@@ -439,16 +461,15 @@ check "not ignored: repaired, status healthy" test "$(status_rc "$P13M")" = 0
 check "not ignored: devproc's own paths hidden again" test -z "$(git -C "$P13M" status --porcelain -uall | grep -v '^?? .claude/rules/')"
 check "not ignored: the rules folder line not forced back (a team may commit the rules)" test -n "$(git -C "$P13M" status --porcelain -uall | grep '^?? .claude/rules/')"
 cp "$T/ex13.saved" "$P13M/.git/info/exclude"
-echo "-- repair fails half way and rolls back to the damaged state"
+echo "-- repair stops half way, after moving the tampered snapshot aside; a rerun finishes it"
 D13M="$P13M/.claude/devproc/dist/9.9.20"
-chmod u+w "$D13M/plugin/scripts/guard.py"; echo "# tampered" >> "$D13M/plugin/scripts/guard.py"   # left writable: the rollback must keep modes too
-before="$(state "$P13M")"
+chmod u+w "$D13M/plugin/scripts/guard.py"; echo "# tampered" >> "$D13M/plugin/scripts/guard.py"
 fake_fail plugin validate "$D13M"
-PATH="$T/fakebin:$PATH" "$SRC/install.sh" --repair --apply "$P13M" > "$T/rprb.log" 2>&1 && bad "repair rollback: should fail" || true
-check "repair rollback: complete" grep -q "rolled back; nothing from this run is left" "$T/rprb.log"
-check "repair rollback: directory and registry as before" test "$before" = "$(state "$P13M")"
-inst --repair --apply "$P13M" > "$T/rp2.log" || { cat "$T/rp2.log"; bad "repair after rollback exit"; }
-check "repair after rollback: healthy" test "$(status_rc "$P13M")" = 0
+check "repair stopped: exit 3" stops "$T/rprb.log" env PATH="$T/fakebin:$PATH" "$SRC/install.sh" --repair --apply "$P13M"
+check "repair stopped: the tampered snapshot moved aside, not deleted" test -n "$(ls -d "$D13M".broken-* 2>/dev/null)"
+inst --repair --apply "$P13M" > "$T/rp2.log" || { cat "$T/rp2.log"; bad "repair rerun exit"; }
+check "repair rerun: healthy" test "$(status_rc "$P13M")" = 0
+check "repair rerun: the snapshot moved aside is removed" test -z "$(ls -d "$D13M".broken-* 2>/dev/null)"
 echo "-- upgrade dry run writes nothing; going back to the kept previous version reuses its snapshot"
 before="$(state "$P12")"
 inst --upgrade "$P12" > "$T/updry.log"
@@ -517,24 +538,24 @@ else
   check "last 0.2.0 install removed: shared marketplace removed" reg_lacks devproc
   check "0.2.0 p18 removed: empty again (only .git)" test "$(ls -A "$P18")" = ".git"
   check "0.2.0 p18 removed: exclude file as before install" test "$ex18" = "$(sha256sum < "$P18/.git/info/exclude")"
-  echo "-- migration fails half way and rolls back to the 0.2.0 install"
+  echo "-- a 0.2.0 install whose plugin the project had before devproc: migration refuses"
   P19="$T/p19"; mkdir -p "$P19"; git -C "$P19" init -q; ex19="$(sha256sum < "$P19/.git/info/exclude")"
   "$OLD/install.sh" --apply "$P19" > "$T/o19.log" || { cat "$T/o19.log"; bad "0.2.0 install p19"; }
-  before="$(snap "$P19")"
-  fake_fail plugin install "$(mname "$P19" | sed 's/^/devproc@/')"
-  PATH="$T/fakebin:$PATH" "$SRC/install.sh" --upgrade --apply "$P19" > "$T/m19.log" 2>&1 && bad "migration rollback: should fail" || true
-  check "migration rollback: complete" grep -q "rolled back; nothing from this run is left" "$T/m19.log"
-  check "migration rollback: directory as before" test "$before" = "$(snap "$P19")"
-  check "migration rollback: new marketplace not registered" reg_lacks "$(mname "$P19")"
-  check "migration rollback: still loads from the 0.2.0 source" test "$(session_hooks "$P19")" = "$OLD/plugin/hooks/hooks.json"
-  check "migration rollback: status says 0.2.0 layout, enabled (exit 0)" test "$(status_rc "$P19")" = 0
-  echo "-- a 0.2.0 install whose plugin the project had before devproc: migration refuses"
   python3 -I -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["pluginInstalledByDevproc"]=False; open(p,"w").write(json.dumps(d))' "$P19/.claude/devproc/manifest.json"
   before="$(state "$P19")"
   inst --upgrade --apply "$P19" > "$T/m19b.log" 2>&1 && bad "not ours: migration should refuse" || true
   check "not ours: migration refused" grep -q "devproc did not install it" "$T/m19b.log"
   check "not ours: nothing changed" test "$before" = "$(state "$P19")"
   python3 -I -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["pluginInstalledByDevproc"]=True; open(p,"w").write(json.dumps(d))' "$P19/.claude/devproc/manifest.json"
+  echo "-- migration stops half way; a rerun finishes it"
+  fake_fail plugin install "$(mname "$P19" | sed 's/^/devproc@/')"
+  check "migration stopped: exit 3" stops "$T/m19.log" env PATH="$T/fakebin:$PATH" "$SRC/install.sh" --upgrade --apply "$P19"
+  check "migration stopped: the manifest says the migration is pending" test "$(mf "$P19" pending)" = migrate
+  check "migration stopped: status exit 4" test "$(status_rc "$P19")" = 4
+  inst --upgrade --apply "$P19" > "$T/m19r.log" || { cat "$T/m19r.log"; bad "migration rerun exit"; }
+  check "migration rerun: healthy, loads its own snapshot" test "$(status_rc "$P19")" = 0 -a "$(loaded "$P19")" = "$P19/.claude/devproc/dist/9.9.20/plugin"
+  check "migration rerun: the old plugin id gone from its settings" lacks "$P19/.claude/settings.local.json" "\"devproc@devproc\""
+  check "migration rerun: the shared marketplace removed (no other 0.2.0 install)" reg_lacks devproc
   uninst --apply "$P19" > "$T/u19.log" || { cat "$T/u19.log"; bad "p19 uninstall exit"; }
   check "p19: empty again (only .git)" test "$(ls -A "$P19")" = ".git"
   check "p19: exclude file as before install" test "$ex19" = "$(sha256sum < "$P19/.git/info/exclude")"
@@ -557,6 +578,26 @@ else
   check "migrated p30: the project's pattern works again" git -C "$P30" check-ignore -q x.log
   check "migrated p30: status healthy" test "$(status_rc "$P30")" = 0
   uninst --apply "$P30" > "$T/u30.log" || { cat "$T/u30.log"; bad "p30 uninstall exit"; }
+  echo "-- a 0.2.0 migration killed after its manifest was written: a rerun finishes it, or uninstall removes both layouts"
+  for how in rerun uninstall; do
+    P56="$T/p56-$how"; mkdir -p "$P56/.claude"; git -C "$P56" init -q; printf '*.log' > "$P56/.git/info/exclude"
+    printf '{\r\n  "env": {"MY_VAR": "1"}\r\n}\r\n' > "$P56/.claude/settings.local.json"
+    "$OLD/install.sh" --apply "$P56" > "$T/o56.log" || { cat "$T/o56.log"; bad "0.2.0 install p56"; }
+    k="$(inst --upgrade "$P56" | step_of 'write read-only plugin snapshot')"
+    set +e; DEVPROC_FAILPOINT="step:$k" inst --upgrade --apply "$P56" > "$T/k56.log" 2>&1; rc=$?; set -e
+    check "migration killed ($how): killed (exit 137), the migration pending" test -n "$k" -a "$rc" = 137 -a "$(mf "$P56" pending)" = migrate
+    if [ "$how" = rerun ]; then
+      inst --upgrade --apply "$P56" > "$T/m56.log" 2>&1 || { cat "$T/m56.log"; bad "p56 migration rerun"; }
+      check "migration killed, rerun: healthy" test "$(status_rc "$P56")" = 0
+      check "migration killed, rerun: the project's last pattern works again" git -C "$P56" check-ignore -q x.log
+    fi
+    uninst --apply "$P56" > "$T/u56.log" 2>&1 || { cat "$T/u56.log"; bad "p56 uninstall"; }
+    check "migration killed ($how), then uninstall: the 0.2.0 plugin neither enabled nor recorded here" test -z "$(grep -s 'devproc' "$P56/.claude/settings.local.json")"
+    check "migration killed ($how), then uninstall: no plugin record here" no_recs_at "$P56"
+    check "migration killed ($how), then uninstall: the shared marketplace removed (no other 0.2.0 install)" reg_lacks devproc
+    check "migration killed ($how), then uninstall: the project's settings kept" grep -q MY_VAR "$P56/.claude/settings.local.json"
+    check "migration killed ($how), then uninstall: the pattern works, no devproc line left" test -z "$(grep -v '^\*\.log$' "$P56/.git/info/exclude")" -a -n "$(grep -x '\*\.log' "$P56/.git/info/exclude")"
+  done
   check "p30 removed: the pattern still works, no devproc line left" test -z "$(grep -v '^\*\.log$' "$P30/.git/info/exclude")" -a -n "$(grep -x '\*\.log' "$P30/.git/info/exclude")"
 fi
 
@@ -566,7 +607,7 @@ python3 -I -c 'import fcntl,os,sys,time; fd=os.open(sys.argv[1], os.O_RDONLY); f
 lockpid=$!
 for _ in $(seq 100); do [ -e "$T/locked" ] && break; sleep 0.1; done
 set +e; inst --apply "$P22" > "$T/lock.log" 2>&1; rc=$?; set -e
-kill "$lockpid"; wait "$lockpid" 2>/dev/null || true
+kill "$lockpid" 2>/dev/null || true; wait "$lockpid" 2>/dev/null || true
 check "locked: refused with exit 1" test "$rc" = 1
 check "locked: says another run is working" grep -q "another devproc run is working on" "$T/lock.log"
 check "locked: nothing written" test ! -e "$P22/.claude"
@@ -617,14 +658,218 @@ check "no final newline, copy in another repo: that repo's exclude file byte-ide
 uninst --apply "$P24" > "$T/u24.log" || { cat "$T/u24.log"; bad "p24 uninstall exit"; }
 check "no final newline: exclude file byte-identical after uninstall" test "$(cat "$P24/.git/info/exclude")" = '*.log' -a "$(wc -c < "$P24/.git/info/exclude")" = 5
 
-echo "== failed install with an existing settings.local.json: restored to its exact bytes"
+echo "== a moved directory's repair killed part-way, on an exclude file without a final newline"
+P57="$T/p57"; mkdir -p "$P57"; git -C "$P57" init -q; printf '*.log' > "$P57/.git/info/exclude"
+inst --apply "$P57" > /dev/null || bad "p57 install exit"
+mv "$P57" "$T/p57m"; P57="$T/p57m"
+k="$(inst --repair "$P57" | step_of 'claude plugin marketplace add')"
+set +e; DEVPROC_FAILPOINT="step:$k" inst --repair --apply "$P57" > "$T/k57.log" 2>&1; rc=$?; set -e
+check "moved, repair killed: killed (exit 137)" test -n "$k" -a "$rc" = 137
+inst --repair --apply "$P57" > "$T/r57.log" 2>&1 || { cat "$T/r57.log"; bad "p57 repair rerun"; }
+check "moved, repair killed, rerun: healthy" test "$(status_rc "$P57")" = 0
+uninst --apply "$P57" > /dev/null || bad "p57 uninstall exit"
+check "moved, repair killed, rerun, uninstall: exclude file byte-identical" test "$(cat "$P57/.git/info/exclude")" = '*.log' -a "$(wc -c < "$P57/.git/info/exclude")" = 5
+
+echo "== a moved directory's repair killed part-way, then moved again: the rerun removes the name it gave the middle place"
+P58="$T/p58"; mkdir -p "$P58"; git -C "$P58" init -q
+inst --apply "$P58" > /dev/null || bad "p58 install exit"
+mv "$P58" "$T/p58b"; P58="$T/p58b"; m58b="$(mname "$P58")"
+k="$(inst --repair "$P58" | step_of 'claude plugin install')"
+set +e; DEVPROC_FAILPOINT="step:$k" inst --repair --apply "$P58" > "$T/k58.log" 2>&1; rc=$?; set -e
+check "moved twice: the repair killed after registering the middle place (exit 137)" test -n "$k" -a "$rc" = 137
+check "moved twice: the middle place's marketplace registered before the kill" reg_has "$m58b"
+mv "$P58" "$T/p58c"; P58="$T/p58c"
+inst --repair --apply "$P58" > "$T/r58.log" 2>&1 || { cat "$T/r58.log"; bad "p58 repair rerun"; }
+check "moved twice, rerun: healthy" test "$(status_rc "$P58")" = 0
+check "moved twice, rerun: the middle place's marketplace removed" reg_lacks "$m58b"
+uninst --apply "$P58" > /dev/null || bad "p58 uninstall exit"
+check "moved twice, then uninstall: empty again (only .git)" test "$(ls -A "$P58")" = ".git"
+check "moved twice, then uninstall: no records at the middle place" no_recs_at "$T/p58b"
+check "moved twice, then uninstall: no records at the last place" no_recs_at "$P58"
+
+echo "== uninstall killed between removing the manifest and its folders: a rerun removes them"
+P59="$T/p59"; mkdir -p "$P59"; git -C "$P59" init -q
+inst --apply "$P59" > /dev/null || bad "p59 install exit"
+set +e; DEVPROC_FAILPOINT=uninstall:manifest-removed uninst --apply "$P59" > "$T/k59.log" 2>&1; rc=$?; set -e
+check "uninstall killed after removing the manifest: killed (exit 137), devproc's folders left" test "$rc" = 137 -a -d "$P59/.claude/devproc" -a ! -e "$P59/.claude/devproc/manifest.json"
+uninst --apply "$P59" > "$T/u59.log" 2>&1 || { cat "$T/u59.log"; bad "p59 uninstall rerun"; }
+check "uninstall killed after removing the manifest: a rerun removes devproc's empty folders" test ! -e "$P59/.claude/devproc" -a ! -e "$P59/.claude/rules/devproc"
+
+echo "== install killed in its first step, then uninstall (no manifest yet): devproc's folders and temp file removed"
+P60="$T/p60"; mkdir -p "$P60"; git -C "$P60" init -q
+set +e; DEVPROC_FAILPOINT=write:manifest.json inst --apply "$P60" > "$T/k60.log" 2>&1; rc=$?; set -e
+check "killed in the first step: killed (exit 137), a temp file and no manifest" test "$rc" = 137 -a ! -e "$P60/.claude/devproc/manifest.json" -a -n "$(find "$P60/.claude" -name '*.devproc-tmp')"
+uninst --apply "$P60" > "$T/u60.log" 2>&1 || { cat "$T/u60.log"; bad "p60 uninstall exit"; }
+check "killed in the first step, then uninstall: the temp file and devproc's folders removed" test -z "$(find "$P60/.claude" -name '*.devproc-tmp')" -a ! -e "$P60/.claude/devproc" -a ! -e "$P60/.claude/rules/devproc"
+
+echo "== a moved directory without its own settings file: repair killed early, then uninstall"
+P61="$T/p61"; mkdir -p "$P61"; git -C "$P61" init -q; ex61="$(sha256sum < "$P61/.git/info/exclude")"
+inst --apply "$P61" > /dev/null || bad "p61 install exit"
+mv "$P61" "$T/p61m"; P61="$T/p61m"
+k="$(inst --repair "$P61" | step_of 'drop devproc-')"
+set +e; DEVPROC_FAILPOINT="step:$k" inst --repair --apply "$P61" > "$T/k61.log" 2>&1; rc=$?; set -e
+check "moved, repair killed before leaving the old name: killed (exit 137)" test -n "$k" -a "$rc" = 137
+uninst --apply "$P61" > "$T/u61.log" 2>&1 || { cat "$T/u61.log"; bad "p61 uninstall exit"; }
+check "moved, repair killed, then uninstall: the exclude file as before install" test "$ex61" = "$(sha256sum < "$P61/.git/info/exclude")"
+check "moved, repair killed, then uninstall: empty again (only .git)" test "$(ls -A "$P61")" = ".git"
+
+echo "== the exclude file holds a line that is not UTF-8"
+P62="$T/p62"; mkdir -p "$P62"; git -C "$P62" init -q
+inst --apply "$P62" > /dev/null || bad "p62 install exit"
+printf 'caf\xe9.txt\n' >> "$P62/.git/info/exclude"
+uninst --apply "$P62" > "$T/u62.log" 2>&1 || { cat "$T/u62.log"; bad "p62 uninstall exit"; }
+check "a line that is not UTF-8: uninstall completes, the line kept byte for byte" grep -qa "$(printf 'caf\xe9.txt')" "$P62/.git/info/exclude"
+check "a line that is not UTF-8: no devproc line left" lacks "$P62/.git/info/exclude" "added by devproc"
+
+echo "== a process a claude call starts and leaves running does not hold devproc's locks"
+cat > "$T/fakebin/claude" <<EOF
+#!/usr/bin/env bash
+case "\$*" in "plugin install"*) setsid sleep 60 < /dev/null > /dev/null 2>&1 & echo \$! > "$T/daemon.pid" ;; esac
+exec "$real" "\$@"
+EOF
+chmod +x "$T/fakebin/claude"
+P63="$T/p63"; mkdir -p "$P63"; git -C "$P63" init -q
+PATH="$T/fakebin:$PATH" inst --apply "$P63" > "$T/i63.log" 2>&1 || { cat "$T/i63.log"; bad "p63 install exit"; }
+set +e; uninst --apply "$P63" > "$T/u63.log" 2>&1; rc=$?; set -e
+kill "$(cat "$T/daemon.pid")" 2>/dev/null || true
+check "a daemon a claude call started: the next run is not locked out" test "$rc" = 0 -a "$(ls -A "$P63")" = ".git"
+
+echo "== a copy of an install in a linked worktree: its uninstall leaves the main checkout's exclude lines"
+P64="$T/p64"; mkdir -p "$P64"; git -C "$P64" init -q; git -C "$P64" -c user.name=t -c user.email=t@t commit -q --allow-empty -m base
+inst --apply "$P64" > /dev/null || bad "p64 install exit"
+git -C "$P64" worktree add -q "$T/p64wt" -b wt64; cp -a "$P64/.claude" "$T/p64wt/.claude"
+ex64="$(sha256sum < "$P64/.git/info/exclude")"
+uninst --apply "$T/p64wt" > "$T/u64.log" 2>&1 || { cat "$T/u64.log"; bad "p64 worktree copy uninstall exit"; }
+check "worktree copy uninstall: the main checkout's exclude file untouched" test "$ex64" = "$(sha256sum < "$P64/.git/info/exclude")"
+check "worktree copy uninstall: the main checkout still healthy" test "$(status_rc "$P64")" = 0
+uninst --apply "$P64" > /dev/null || bad "p64 uninstall exit"
+
+echo "== a settings.local.json with non-ASCII text, under a Latin-1 locale"
+LOC="$T/locale"; mkdir -p "$LOC"
+if localedef -i en_US -f ISO-8859-1 "$LOC/en_US.ISO-8859-1" > /dev/null 2>&1; then
+  P65="$T/p65"; mkdir -p "$P65/.claude"; git -C "$P65" init -q
+  printf '{"env": {"NOTE": "caf\xc3\xa9 \xe0\xb8\x81"}}\n' > "$P65/.claude/settings.local.json"; cp "$P65/.claude/settings.local.json" "$T/sl65"
+  LOCPATH="$LOC" LC_ALL=en_US.ISO-8859-1 "$SRC/install.sh" --apply "$P65" > "$T/i65.log" 2>&1 || { cat "$T/i65.log"; bad "p65 install exit"; }
+  LOCPATH="$LOC" LC_ALL=en_US.ISO-8859-1 "$SRC/uninstall.sh" --apply "$P65" > "$T/u65.log" 2>&1 || { cat "$T/u65.log"; bad "p65 uninstall exit"; }
+  check "Latin-1 locale: settings.local.json byte-identical after install and uninstall" cmp -s "$P65/.claude/settings.local.json" "$T/sl65"
+else
+  bad "Latin-1 locale check SKIPPED: localedef could not build en_US.ISO-8859-1"
+fi
+
+echo "== no manifest, a symlinked .claude: uninstall refuses, the other directory untouched"
+O66="$T/p66o"; Q66="$T/p66q"; mkdir -p "$O66/.claude/devproc/dist" "$Q66"; git -C "$Q66" init -q; ln -s "$O66/.claude" "$Q66/.claude"
+set +e; uninst --apply "$Q66" > "$T/u66.log" 2>&1; rc=$?; set -e
+check "no manifest, symlinked .claude: uninstall refused (exit 1)" test "$rc" = 1 -a -n "$(grep 'is a symlink' "$T/u66.log")"
+check "no manifest, symlinked .claude: the other directory's folders untouched" test -d "$O66/.claude/devproc/dist"
+
+echo "== the main checkout's uninstall leaves the exclude lines a worktree copy relies on"
+P67="$T/p67"; mkdir -p "$P67"; git -C "$P67" init -q; git -C "$P67" -c user.name=t -c user.email=t@t commit -q --allow-empty -m base
+cp "$P67/.git/info/exclude" "$T/ex67"
+inst --apply "$P67" > /dev/null || bad "p67 install exit"
+git -C "$P67" worktree add -q "$T/p67wt" -b wt67; cp -a "$P67/.claude" "$T/p67wt/.claude"
+uninst --apply "$P67" > "$T/u67.log" 2>&1 || { cat "$T/u67.log"; bad "p67 main checkout uninstall exit"; }
+check "main checkout uninstall: the worktree copy's devproc files still ignored" test -z "$(git -C "$T/p67wt" status --porcelain)"
+uninst --apply "$T/p67wt" > /dev/null || bad "p67 worktree copy uninstall exit"
+check "main checkout, then worktree copy uninstalled: exclude file as before" cmp -s "$P67/.git/info/exclude" "$T/ex67"
+
+echo "== a .git/info/exclude kept as a symlink stays one"
+P68="$T/p68"; mkdir -p "$P68" "$T/dot68"; git -C "$P68" init -q
+printf '*.log\nbuild/' > "$T/dot68/exclude"; cp "$T/dot68/exclude" "$T/ex68"
+rm -f "$P68/.git/info/exclude"; ln -s "$T/dot68/exclude" "$P68/.git/info/exclude"
+inst --apply "$P68" > /dev/null || bad "p68 install exit"
+check "symlinked exclude: still a symlink after install" test -L "$P68/.git/info/exclude"
+check "symlinked exclude: devproc's lines written through to the file it points to" grep -qxF "/.claude/devproc/" "$T/dot68/exclude"
+uninst --apply "$P68" > /dev/null || bad "p68 uninstall exit"
+check "symlinked exclude: still a symlink after uninstall, its file as before" test -L "$P68/.git/info/exclude" -a "$(sha256sum < "$T/dot68/exclude")" = "$(sha256sum < "$T/ex68")"
+
+echo "== two repositories whose .git/info/exclude links to one shared file: each uninstall keeps the other's lines"
+mkdir -p "$T/dot69"; printf '*.log\n' > "$T/dot69/exclude"; cp "$T/dot69/exclude" "$T/ex69"
+for r in p69a p69b; do mkdir -p "$T/$r"; git -C "$T/$r" init -q; rm -f "$T/$r/.git/info/exclude"; ln -s "$T/dot69/exclude" "$T/$r/.git/info/exclude"; done
+inst --apply "$T/p69a" > /dev/null || bad "p69a install exit"
+inst --apply "$T/p69b" > /dev/null || bad "p69b install exit"
+uninst --apply "$T/p69b" > /dev/null || bad "p69b uninstall exit"
+check "shared linked exclude file: after the second repo's uninstall, the first still healthy" test "$(status_rc "$T/p69a")" = 0
+uninst --apply "$T/p69a" > /dev/null || bad "p69a uninstall exit"
+check "shared linked exclude file: after both uninstalls, the shared file as before" cmp -s "$T/dot69/exclude" "$T/ex69"
+
+echo "== a worktree whose .claude links to the main checkout's: the main checkout's uninstall removes all its lines"
+P70="$T/p70"; mkdir -p "$P70"; git -C "$P70" init -q; git -C "$P70" -c user.name=t -c user.email=t@t commit -q --allow-empty -m base
+cp "$P70/.git/info/exclude" "$T/ex70"
+inst --apply "$P70" > /dev/null || bad "p70 install exit"
+git -C "$P70" worktree add -q "$T/p70wt" -b wt70; ln -s "$P70/.claude" "$T/p70wt/.claude"
+uninst --apply "$P70" > /dev/null || bad "p70 uninstall exit"
+check "worktree with a linked .claude: main checkout uninstall leaves the exclude file as before" cmp -s "$P70/.git/info/exclude" "$T/ex70"
+
+echo "== lines an uninstall keeps for files left behind survive another install's uninstall of the same exclude file"
+P71="$T/p71"; mkdir -p "$P71"; git -C "$P71" init -q; git -C "$P71" -c user.name=t -c user.email=t@t commit -q --allow-empty -m base
+
+inst --apply "$P71" > /dev/null || bad "p71 install exit"
+git -C "$P71" worktree add -q "$T/p71wt" -b wt71; cp -a "$P71/.claude" "$T/p71wt/.claude"
+mkdir -p "$T/p71wt/.claude/devproc/tasks/t"; echo x > "$T/p71wt/.claude/devproc/tasks/t/TASK.md"
+uninst --apply "$T/p71wt" > /dev/null || bad "p71 worktree copy uninstall exit"
+uninst --apply "$P71" > /dev/null || bad "p71 main checkout uninstall exit"
+check "kept for files left behind: the worktree's task data still ignored after the main checkout's uninstall" test -z "$(git -C "$T/p71wt" status --porcelain)"
+check "kept for files left behind: the marker above the kept line names the worktree" grep -qF "files left in $(realpath "$T/p71wt");" "$P71/.git/info/exclude"
+
+echo "== repair finishing a stopped upgrade refuses a seeded file that is a symlink"
+S72="$T/src72"; cp -a "$SRC" "$S72"; chmod -R u+w "$S72"
+P72="$T/p72"; Q72="$T/q72"; for d in "$P72" "$Q72"; do mkdir -p "$d"; git -C "$d" init -q; "$S72/install.sh" --apply "$d" > /dev/null || bad "p72 install exit"; done
+python3 -I -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["version"]="9.9.72"; open(p,"w").write(json.dumps(d))' "$S72/plugin/.claude-plugin/plugin.json"
+echo "- changed" >> "$S72/plugin/templates/rules/00-precedence.md"
+set +e; DEVPROC_FAILPOINT=step:3 "$S72/install.sh" --upgrade --apply "$P72" > /dev/null 2>&1; set -e
+q72="$(sha256sum < "$Q72/.claude/rules/devproc/00-precedence.md")"
+rm "$P72/.claude/rules/devproc/00-precedence.md"; ln -s "$Q72/.claude/rules/devproc/00-precedence.md" "$P72/.claude/rules/devproc/00-precedence.md"
+set +e; "$S72/install.sh" --repair --apply "$P72" > "$T/r72.log" 2>&1; rc=$?; set -e
+check "pending upgrade, symlinked rule: repair refused (exit 1)" test "$rc" = 1 -a -n "$(grep 'is a symlink' "$T/r72.log")"
+check "pending upgrade, symlinked rule: the other directory's rule untouched" test "$q72" = "$(sha256sum < "$Q72/.claude/rules/devproc/00-precedence.md")"
+rm "$P72/.claude/rules/devproc/00-precedence.md"
+for d in "$P72" "$Q72"; do "$S72/uninstall.sh" --apply "$d" > "$T/u72.log" 2>&1 || { cat "$T/u72.log"; bad "p72 uninstall exit"; }; done
+check "pending upgrade, symlinked rule: both directories uninstalled, no registry record left" no_recs_at "$P72"
+
+echo "== the project's own settings entries: install, uninstall, reinstall, uninstall keeps the file ignored"
+P73="$T/p73"; mkdir -p "$P73"; git -C "$P73" init -q
+inst --apply "$P73" > /dev/null || bad "p73 install exit"
+python3 -I -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d.setdefault("permissions",{})["allow"]=["Bash(ls:*)"]; open(p,"w").write(json.dumps(d))' "$P73/.claude/settings.local.json"
+uninst --apply "$P73" > /dev/null || bad "p73 uninstall exit"
+inst --apply "$P73" > /dev/null || bad "p73 reinstall exit"
+uninst --apply "$P73" > /dev/null || bad "p73 second uninstall exit"
+check "own settings entries: after the second uninstall the settings file still ignored" test -z "$(git -C "$P73" status --porcelain)"
+
+echo "== a line kept for a worktree copy's files: deleting it as the note says leaves the main checkout ignored"
+P74="$T/p74"; mkdir -p "$P74"; git -C "$P74" init -q; git -C "$P74" -c user.name=t -c user.email=t@t commit -q --allow-empty -m base
+inst --apply "$P74" > /dev/null || bad "p74 install exit"
+git -C "$P74" worktree add -q "$T/p74wt" -b wt74; cp -a "$P74/.claude" "$T/p74wt/.claude"
+mkdir -p "$T/p74wt/.claude/devproc/tasks/t"; echo x > "$T/p74wt/.claude/devproc/tasks/t/TASK.md"
+uninst --apply "$T/p74wt" > /dev/null || bad "p74 worktree copy uninstall exit"
+drop_kept() { python3 -I -c 'import sys; p, d = sys.argv[1], sys.argv[2]; l = open(p).read().split("\n")
+out, i = [], 0
+while i < len(l):
+    if d in l[i] and l[i].startswith("# devproc: kept by"): i += 2; continue
+    out.append(l[i]); i += 1
+open(p, "w").write("\n".join(out))' "$1" "$2"; }
+rm -rf "$T/p74wt/.claude"; drop_kept "$P74/.git/info/exclude" "$(realpath "$T/p74wt")"
+check "kept line for a worktree copy deleted by hand: the main checkout still healthy" test "$(status_rc "$P74")" = 0
+uninst --apply "$P74" > /dev/null || bad "p74 uninstall exit"
+
+echo "== uninstall killed after marking kept lines, files then removed: a rerun removes the lines too"
+P75="$T/p75"; mkdir -p "$P75"; git -C "$P75" init -q; cp "$P75/.git/info/exclude" "$T/ex75"
+inst --apply "$P75" > /dev/null || bad "p75 install exit"
+mkdir -p "$P75/.claude/devproc/tasks/t"; echo x > "$P75/.claude/devproc/tasks/t/TASK.md"
+k75="$(uninst "$P75" 2>&1 | step_of "mark the lines kept")"
+check "kept lines: uninstall plans a step marking them" test -n "$k75"
+set +e; DEVPROC_FAILPOINT="step:$((k75 + 1))" uninst --apply "$P75" > /dev/null 2>&1; set -e
+rm -rf "$P75/.claude/devproc/tasks"
+uninst --apply "$P75" > /dev/null || bad "p75 uninstall rerun exit"
+check "uninstall killed after marking, files removed, rerun: exclude file as before" cmp -s "$P75/.git/info/exclude" "$T/ex75"
+
+echo "== failed install with an existing settings.local.json: uninstall restores its exact bytes"
 P25="$T/p25"; mkdir -p "$P25/.claude"; git -C "$P25" init -q
 printf '{"permissions":{"allow":["Bash(ls *)"]}}\r\n' > "$P25/.claude/settings.local.json"
 before="$(state "$P25")"
 fake_fail plugin install
-PATH="$T/fakebin:$PATH" "$SRC/install.sh" --apply "$P25" > "$T/rb25.log" 2>&1 && bad "p25: install should fail" || true
-check "p25 rollback: complete" grep -q "nothing from this run is left" "$T/rb25.log"
-check "p25 rollback: directory (settings bytes included) and registry as before" test "$before" = "$(state "$P25")"
+check "p25: stopped (exit 3)" stops "$T/rb25.log" env PATH="$T/fakebin:$PATH" "$SRC/install.sh" --apply "$P25"
+uninst --apply "$P25" > "$T/u25a.log" || { cat "$T/u25a.log"; bad "p25 uninstall after the failed install"; }
+check "p25: after uninstall, directory (settings bytes included) and registry as before" test "$before" = "$(state "$P25")"
 inst --apply "$P25" > "$T/i25.log" || { cat "$T/i25.log"; bad "p25 install exit"; }
 uninst --apply "$P25" > "$T/u25.log" || { cat "$T/u25.log"; bad "p25 uninstall exit"; }
 check "p25: CRLF settings file byte-identical after install and uninstall" test "$before" = "$(state "$P25")"
@@ -753,7 +998,9 @@ P39="$T/p39"; mkdir -p "$P39"; git -C "$P39" init -q; ex39="$(sha256sum < "$P39/
 inst --apply "$P39" > "$T/i39.log" || { cat "$T/i39.log"; bad "p39 install exit"; }
 mkdir -p "$P39/.claude/devproc/tasks/t"; echo x > "$P39/.claude/devproc/tasks/t/TASK.md"
 uninst --apply "$P39" > "$T/u39.log" || { cat "$T/u39.log"; bad "p39 uninstall exit"; }
+check "kept for files left behind: the marker above the kept line names this directory" grep -qF "files left in $(realpath "$P39");" "$P39/.git/info/exclude"
 inst --apply "$P39" > "$T/i39b.log" || { cat "$T/i39b.log"; bad "p39 reinstall exit"; }
+check "reinstall: its kept lines are devproc's own again (no kept marker left)" test -z "$(grep -F "files left in" "$P39/.git/info/exclude")"
 rm -rf "$P39/.claude/devproc/tasks"
 uninst --apply "$P39" > "$T/u39b.log" || { cat "$T/u39b.log"; bad "p39 second uninstall exit"; }
 check "reinstall: after the last uninstall the exclude file is as before the first install" test "$ex39" = "$(sha256sum < "$P39/.git/info/exclude")"
@@ -768,7 +1015,7 @@ check "broken .git file: install refused" refused "$P38B" "git cannot read the r
 rm "$P38/.git"; mv "$T/p38.git" "$P38/.git"
 uninst --apply "$P38" > "$T/u38.log" || { cat "$T/u38.log"; bad "p38 uninstall exit"; }
 
-echo "== SIGHUP (terminal closed) rolls back; under nohup the run goes on"
+echo "== SIGHUP (terminal closed): the run stops after the current step; under nohup it goes on"
 cat > "$T/fakebin/claude" <<EOF
 #!/usr/bin/env bash
 case "\$*" in "plugin install"*) touch "$T/in-install"; sleep 8 ;; esac
@@ -779,23 +1026,26 @@ P40="$T/p40"; mkdir -p "$P40"; git -C "$P40" init -q
 before="$(state "$P40")"; rm -f "$T/in-install"
 PATH="$T/fakebin:$PATH" "$SRC/install.sh" --apply "$P40" > "$T/hup.log" 2>&1 & hpid=$!
 for _ in $(seq 600); do [ -e "$T/in-install" ] && break; sleep 0.2; done
-kill -HUP "$hpid"; set +e; wait "$hpid"; rc=$?; set -e
-check "SIGHUP: exit 1 (rolled back)" test "$rc" = 1
-check "SIGHUP: directory and registry as before" test "$before" = "$(state "$P40")"
+kill -HUP "$hpid" 2>/dev/null || true; set +e; wait "$hpid"; rc=$?; set -e
+check "SIGHUP: exit 3, stopped before the next step" test "$rc" = 3 -a -n "$(grep 'interrupted: stopped before the step' "$T/hup.log")"
+check "SIGHUP: says it stops after the current step" grep -q "stopping after the current step" "$T/hup.log"
+check "SIGHUP: the step it was in finished (the plugin is installed)" has_rec "$(mf "$P40" pluginId)" "$P40"
+inst --apply "$P40" > "$T/hup2.log" 2>&1 || { cat "$T/hup2.log"; bad "SIGHUP: rerun exit"; }
+check "SIGHUP: a rerun finishes it, healthy" test "$(status_rc "$P40")" = 0
+uninst --apply "$P40" > "$T/u40a.log" || { cat "$T/u40a.log"; bad "p40 uninstall exit"; }
+check "SIGHUP: after uninstall, directory and registry as before" test "$before" = "$(state "$P40")"
 rm -f "$T/in-install"
 PATH="$T/fakebin:$PATH" nohup "$SRC/install.sh" --apply "$P40" > "$T/nohup.log" 2>&1 & hpid=$!
 for _ in $(seq 600); do [ -e "$T/in-install" ] && break; sleep 0.2; done
-kill -HUP "$hpid"; set +e; wait "$hpid"; rc=$?; set -e
+kill -HUP "$hpid" 2>/dev/null || true; set +e; wait "$hpid"; rc=$?; set -e
 check "nohup: run completes despite SIGHUP" test "$rc" = 0 -a "$(status_rc "$P40")" = 0
 uninst --apply "$P40" > "$T/u40.log" || { cat "$T/u40.log"; bad "p40 uninstall exit"; }
 
-wait_for() { for _ in $(seq 600); do [ -e "$1" ] && return 0; sleep 0.2; done; return 1; }
-echo "== a closed terminal or Ctrl-C: the running claude call finishes; a second signal cannot cut the rollback short"
+echo "== a closed terminal or Ctrl-C, twice: the second stops devproc at once; the running claude call still finishes"
 cat > "$T/fakebin/claude" <<EOF
 #!/usr/bin/env bash
 case "\$*" in
   "plugin install"*) touch "$T/in-install"; sleep 8; "$real" "\$@"; rc=\$?; touch "$T/install-done"; exit \$rc ;;
-  "plugin uninstall"*) touch "$T/in-undo"; sleep 3 ;;
 esac
 exec "$real" "\$@"
 EOF
@@ -803,39 +1053,34 @@ chmod +x "$T/fakebin/claude"
 # signals go to the whole process group, as a terminal sends them; setsid gives the run its own group
 for sig in HUP INT; do
   P41="$T/p41-$sig"; mkdir -p "$P41"; git -C "$P41" init -q
-  before="$(state "$P41")"; rm -f "$T/in-install" "$T/install-done" "$T/in-undo"
+  before="$(state "$P41")"; rm -f "$T/in-install" "$T/install-done"
   # Ctrl-C reaches a foreground run only: a background job starts with SIGINT ignored, so reset it
   PATH="$T/fakebin:$PATH" setsid python3 -I -c 'import os, signal, sys
 signal.signal(signal.SIGINT, signal.SIG_DFL); os.execv(sys.argv[1], sys.argv[1:])' \
     "$SRC/install.sh" --apply "$P41" > "$T/sig-$sig.log" 2>&1 & hpid=$!
   wait_for "$T/in-install" || bad "SIG$sig: plugin install never started"
-  kill -"$sig" -- -"$hpid"
-  wait_for "$T/in-undo" || bad "SIG$sig: the rollback never reached plugin uninstall"
-  kill -"$sig" -- -"$hpid"
+  kill -"$sig" -- -"$hpid" 2>/dev/null || true; sleep 1; kill -"$sig" -- -"$hpid" 2>/dev/null || true
   set +e; wait "$hpid"; rc=$?; set -e
-  check "SIG$sig: the running claude call was let finish" test -e "$T/install-done"
-  check "SIG$sig: says it lets the running call finish" grep -qF 'interrupted: letting `claude plugin install' "$T/sig-$sig.log"
-  check "SIG$sig twice: exit 1 (rolled back)" test "$rc" = 1
-  check "SIG$sig twice: directory and registry as before" test "$before" = "$(state "$P41")"
+  check "SIG$sig twice: the first interrupt is announced (stops after the current step)" grep -q "stopping after the current step" "$T/sig-$sig.log"
+  check "SIG$sig twice: exit 3 at once, before the running claude call ended" test "$rc" = 3 -a ! -e "$T/install-done"
+  check "SIG$sig twice: says it stopped at once" grep -q "stopped at once" "$T/sig-$sig.log"
+  set +e; inst --apply "$P41" > "$T/sig1-$sig.log" 2>&1; rc=$?; set -e
+  check "SIG$sig twice: a rerun while the claude call it left still runs is refused (that call holds the lock)" test "$rc" = 1 -a ! -e "$T/install-done" -a -n "$(grep 'claude call it left running' "$T/sig1-$sig.log")"
+  check "SIG$sig twice: the claude call it left still finishes by itself" wait_for "$T/install-done"
+  inst --apply "$P41" > "$T/sig2-$sig.log" 2>&1 || { cat "$T/sig2-$sig.log"; bad "SIG$sig: rerun exit"; }
+  check "SIG$sig twice: a rerun finishes it, healthy" test "$(status_rc "$P41")" = 0
+  uninst --apply "$P41" > /dev/null || bad "p41 uninstall exit"
+  check "SIG$sig twice: after uninstall, directory and registry as before" test "$before" = "$(state "$P41")"
 done
 
-echo "== a step fails, then SIGHUP arrives during its undo: the rollback is not cut short"
-cat > "$T/fakebin/claude" <<EOF
-#!/usr/bin/env bash
-case "\$*" in
-  "plugin install"*) echo "simulated failure" >&2; exit 1 ;;
-  "plugin uninstall"*) touch "$T/in-undo"; sleep 3 ;;
-esac
-exec "$real" "\$@"
-EOF
-chmod +x "$T/fakebin/claude"
-P47="$T/p47"; mkdir -p "$P47"; git -C "$P47" init -q
-before="$(state "$P47")"; rm -f "$T/in-undo"
-PATH="$T/fakebin:$PATH" setsid "$SRC/install.sh" --apply "$P47" > "$T/sig47.log" 2>&1 & hpid=$!
-wait_for "$T/in-undo" || bad "p47: the rollback never reached plugin uninstall"
-kill -HUP -- -"$hpid"; set +e; wait "$hpid"; rc=$?; set -e
-check "failed step, then SIGHUP during the undo: exit 1 (rolled back)" test "$rc" = 1
-check "failed step, then SIGHUP during the undo: directory and registry as before" test "$before" = "$(state "$P47")"
+echo "== an interrupt while waiting for the registry lock: stops at once, nothing changed"
+P47="$T/p47"; mkdir -p "$P47"; git -C "$P47" init -q; before="$(state "$P47")"
+flock "$CLAUDE_CONFIG_DIR" sleep 30 & lp=$!; sleep 1
+setsid "$SRC/install.sh" --apply "$P47" > "$T/l47.log" 2>&1 & hpid=$!
+for _ in $(seq 100); do grep -q "waiting for another devproc run" "$T/l47.log" && break; sleep 0.2; done
+kill -TERM -- -"$hpid" 2>/dev/null || true; set +e; wait "$hpid"; rc=$?; set -e; kill "$lp" 2>/dev/null || true; wait "$lp" 2>/dev/null || true
+check "interrupt while waiting for the lock: exit 3, says nothing was changed" test "$rc" = 3 -a -n "$(grep 'interrupted while waiting.*nothing was changed' "$T/l47.log")"
+check "interrupt while waiting for the lock: directory and registry as before" test "$before" = "$(state "$P47")"
 
 echo "== a hung claude call is stopped at the timeout, with what it started"
 cat > "$T/fakebin/claude" <<EOF
@@ -850,7 +1095,9 @@ P48="$T/p48"; mkdir -p "$P48"; git -C "$P48" init -q; before="$(state "$P48")"
 t0=$SECONDS; set +e; DEVPROC_CLI_TIMEOUT=30 PATH="$T/fakebin:$PATH" "$SRC/install.sh" --apply "$P48" > "$T/to48.log" 2>&1; rc=$?; set -e
 took=$((SECONDS - t0)); kill -0 "$(cat "$T/gc-group.pid")" 2>/dev/null && left=1 || left=""
 kill "$(cat "$T/gc-group.pid")" "$(cat "$T/gc-escaped.pid")" 2>/dev/null || true
-check "timeout: the hung call is stopped and the run rolled back (exit 1)" test "$rc" = 1 -a "$before" = "$(state "$P48")"
+check "timeout: the hung call is stopped and the run stops (exit 3)" test "$rc" = 3
+uninst --apply "$P48" > /dev/null || bad "p48 uninstall exit"
+check "timeout, then uninstall: directory and registry as before" test "$before" = "$(state "$P48")"
 check "timeout: says which call did not finish" grep -q '`claude plugin install.*did not finish within 30 s' "$T/to48.log"
 check "timeout: done within 200 s, though an escaped grandchild still holds the output" test "$took" -lt 200
 check "timeout: the hung call's own child processes are killed" test -z "$left"
@@ -859,25 +1106,28 @@ for v in abc 0 86401 '²'; do
   check "DEVPROC_CLI_TIMEOUT=$v: exit 2, no traceback" test "$rc" = 2 -a -z "$(grep Traceback "$T/tov.log")"
 done
 
-echo "== interrupted while tidying up: the work is kept, nothing rolled back"
+echo "== a moved directory's upgrade interrupted while it leaves the old place: a rerun finishes it"
 P49="$T/p49"; mkdir -p "$P49"; git -C "$P49" init -q
 inst --apply "$P49" > /dev/null || bad "p49 install exit"
 old49="$(mf "$P49" marketplace)"; mv "$P49" "$T/p49m"; P49="$T/p49m"; setver 9.9.49
+session_hooks "$P49" > /dev/null || true   # a record of the old plugin id here
+check "p49: a session left a record of the old plugin id" has_rec "devproc@$old49" "$P49"
 cat > "$T/fakebin/claude" <<EOF
 #!/usr/bin/env bash
-case "\$*" in "plugin marketplace remove $old49"*) touch "$T/in-tidy"; sleep 3 ;; esac
+case "\$*" in "plugin uninstall devproc@$old49"*) touch "$T/in-leave"; sleep 3 ;; esac
 exec "$real" "\$@"
 EOF
-chmod +x "$T/fakebin/claude"; rm -f "$T/in-tidy"
-PATH="$T/fakebin:$PATH" setsid "$SRC/install.sh" --upgrade --apply "$P49" > "$T/tidy49.log" 2>&1 & hpid=$!
-wait_for "$T/in-tidy" || bad "p49: the upgrade never reached the dead registration's removal"
-kill -HUP -- -"$hpid"; set +e; wait "$hpid"; rc=$?; set -e
-check "interrupted while tidying: the upgrade is kept (exit 0, loads 9.9.49)" test "$rc" = 0 -a "$(loaded "$P49")" = "$P49/.claude/devproc/dist/9.9.49/plugin"
-check "interrupted while tidying: says the remaining tidying was not done" grep -q "interrupted while tidying up" "$T/tidy49.log"
-check "interrupted while tidying: names the step not done" grep -qF "not done: claude plugin marketplace remove $old49" "$T/tidy49.log"
-check "interrupted while tidying: a tidying step already done is not listed" lacks "$T/tidy49.log" "not done: remove snapshots"
+chmod +x "$T/fakebin/claude"; rm -f "$T/in-leave"
+PATH="$T/fakebin:$PATH" setsid "$SRC/install.sh" --upgrade --apply "$P49" > "$T/leave49.log" 2>&1 & hpid=$!
+wait_for "$T/in-leave" || bad "p49: the upgrade never reached the old record's removal"
+kill -HUP -- -"$hpid" 2>/dev/null || true; set +e; wait "$hpid"; rc=$?; set -e
+check "interrupted while leaving the old place: exit 3, the upgrade pending" test "$rc" = 3 -a "$(mf "$P49" pending)" = "upgrade to 9.9.49"
+check "interrupted while leaving the old place: the old place's registration still there for the rerun" reg_has "$old49"
+inst --upgrade --apply "$P49" > "$T/leave49b.log" 2>&1 || { cat "$T/leave49b.log"; bad "p49 upgrade rerun"; }
+check "interrupted while leaving the old place, rerun: healthy at 9.9.49" test "$(status_rc "$P49")" = 0 -a "$(loaded "$P49")" = "$P49/.claude/devproc/dist/9.9.49/plugin"
+check "interrupted while leaving the old place, rerun: the dead registration and the old record removed" reg_lacks "$old49"
+check "interrupted while leaving the old place, rerun: no record of the old plugin id here" lacks_rec "devproc@$old49" "$P49"
 uninst --apply "$P49" > /dev/null 2>&1 || bad "p49 uninstall exit"
-claude plugin marketplace remove "$old49" > /dev/null 2>&1 || true   # in case the interrupted call had not removed it
 
 echo "== output pipe closed (| head): the run carries on"
 P42="$T/p42"; mkdir -p "$P42"; git -C "$P42" init -q
@@ -941,6 +1191,78 @@ check "symlinked .claude: refusal names the symlink" grep -q "is a symlink" "$T/
 check "symlinked .claude: status exit 4" test "$(status_rc "$B46")" = 4
 check "symlinked .claude: the other directory's install untouched" test "$asnap" = "$(state "$A46")"
 rm "$B46/.claude"; uninst --apply "$A46" > /dev/null || bad "p46a uninstall exit"
+
+echo "== a kill -9 in the middle of a file write leaves the old bytes or the new, never a cut file"
+setver 9.9.51
+P50="$T/p50"; mkdir -p "$P50"; git -C "$P50" init -q
+inst --apply "$P50" > /dev/null || bad "p50 install exit"
+setver 9.9.52
+set +e; DEVPROC_FAILPOINT=write:manifest.json inst --upgrade --apply "$P50" > "$T/k50.log" 2>&1; rc=$?; set -e
+check "killed at the manifest write: killed (exit 137)" test "$rc" = 137
+check "killed at the manifest write: the manifest is still valid JSON, at the old version" test "$(mf "$P50" version 2>/dev/null)" = 9.9.51
+check "killed at the manifest write: status exit 4, names the temp file left" test "$(status_rc "$P50")" = 4 -a -n "$(grep 'temp file' "$T/status.log")"
+inst --upgrade --apply "$P50" > "$T/u50.log" 2>&1 || { cat "$T/u50.log"; bad "p50 upgrade rerun"; }
+check "killed at the manifest write: a rerun completes the upgrade (9.9.52, healthy)" test "$(mf "$P50" version)" = 9.9.52 -a "$(status_rc "$P50")" = 0
+check "killed at the manifest write: the temp file the kill left is gone" test -z "$(find "$P50/.claude" -name '*.devproc-tmp')"
+uninst --apply "$P50" > /dev/null || bad "p50 uninstall exit"
+
+P51="$T/p51"; mkdir -p "$P51"; git -C "$P51" init -q; printf '*.log\nbuild/' > "$P51/.git/info/exclude"; cp "$P51/.git/info/exclude" "$T/ex51"
+inst --apply "$P51" > /dev/null || bad "p51 install exit"
+set +e; DEVPROC_FAILPOINT=write:exclude uninst --apply "$P51" > "$T/k51.log" 2>&1; rc=$?; set -e
+check "killed at the exclude-file write: killed (exit 137)" test "$rc" = 137
+check "killed at the exclude-file write: the project's patterns are still there" test "$(grep -cxE '\*\.log|build/' "$P51/.git/info/exclude")" = 2
+check "killed during uninstall: status says the uninstall did not finish (exit 4)" test "$(status_rc "$P51")" = 4 -a -n "$(grep 'uninstall) did not finish' "$T/status.log")"
+check "killed during uninstall: install refuses until it is finished" refused "$P51" "an uninstall did not finish"
+uninst --apply "$P51" > "$T/u51.log" 2>&1 || { cat "$T/u51.log"; bad "p51 uninstall rerun"; }
+check "killed at the exclude-file write: a rerun finishes, the exclude file byte-identical to before" cmp -s "$P51/.git/info/exclude" "$T/ex51"
+check "killed at the exclude-file write: no temp file left" test -z "$(find "$P51/.git/info" -name '*.devproc-tmp')"
+
+P52="$T/p52"; mkdir -p "$P52/.claude"; git -C "$P52" init -q
+printf '{\r\n  "env": {"MY_VAR": "1"}\r\n}\r\n' > "$P52/.claude/settings.local.json"; cp "$P52/.claude/settings.local.json" "$T/sl52"
+set +e; DEVPROC_FAILPOINT=write:manifest.json inst --apply "$P52" > "$T/k52.log" 2>&1; rc=$?; set -e
+check "killed at the first manifest write: killed (exit 137), settings.local.json untouched" test "$rc" = 137 -a "$(sha256sum < "$P52/.claude/settings.local.json")" = "$(sha256sum < "$T/sl52")"
+check "killed at the first manifest write: no manifest, a temp file left" test ! -e "$P52/.claude/devproc/manifest.json" -a -n "$(find "$P52/.claude" -name '*.devproc-tmp')"
+inst --apply "$P52" > "$T/i52.log" 2>&1 || { cat "$T/i52.log"; bad "p52 install after the kill"; }
+check "killed at the first manifest write: the next install removes the temp file and completes" test -z "$(find "$P52/.claude" -name '*.devproc-tmp')" -a "$(status_rc "$P52")" = 0
+uninst --apply "$P52" > /dev/null || bad "p52 uninstall exit"
+check "killed at the first manifest write: after uninstall, settings.local.json byte-identical" cmp -s "$P52/.claude/settings.local.json" "$T/sl52"
+check "killed at the first manifest write: after uninstall, devproc's own folders are gone" test ! -e "$P52/.claude/devproc" -a ! -e "$P52/.claude/rules/devproc"
+
+echo "== install killed between two file copies: a rerun copies the rest"
+P55="$T/p55"; mkdir -p "$P55"; git -C "$P55" init -q
+k="$(inst "$P55" | step_of 'copy .*config.json')"
+set +e; DEVPROC_FAILPOINT="step:$k" inst --apply "$P55" > "$T/k55.log" 2>&1; rc=$?; set -e
+check "killed between copies: killed (exit 137), config.json not copied yet" test -n "$k" -a "$rc" = 137 -a ! -e "$P55/.claude/devproc/config.json"
+inst --apply "$P55" > "$T/i55.log" 2>&1 || { cat "$T/i55.log"; bad "p55 install rerun"; }
+check "killed between copies: a rerun copies the rest" test -f "$P55/.claude/devproc/config.json" -a -f "$P55/.claude/devproc/MISTAKES.md" -a "$(status_rc "$P55")" = 0
+check "killed between copies: after the rerun, git status clean (all ignored)" test -z "$(git -C "$P55" status --porcelain -uall)"
+uninst --apply "$P55" > /dev/null || bad "p55 uninstall exit"
+check "killed between copies: after uninstall, empty again (only .git)" test "$(ls -A "$P55")" = ".git"
+
+echo "== kill -9 after the CLI changed settings.local.json: a rerun finishes the install, or uninstall restores the bytes"
+for how in rerun uninstall; do
+  P53="$T/p53-$how"; mkdir -p "$P53/.claude"; git -C "$P53" init -q
+  printf '{\r\n  "env": {"MY_VAR": "1"}\r\n}\r\n' > "$P53/.claude/settings.local.json"; cp "$P53/.claude/settings.local.json" "$T/sl53"
+  before="$(state "$P53")"
+  k="$(inst "$P53" | step_of 'claude plugin install')"
+  set +e; DEVPROC_FAILPOINT="step:$((k + 1))" inst --apply "$P53" > "$T/k53.log" 2>&1; rc=$?; set -e
+  check "killed after plugin install ($how): killed (exit 137), the CLI had changed settings.local.json" test "$rc" = 137 -a "$(sha256sum < "$P53/.claude/settings.local.json")" != "$(sha256sum < "$T/sl53")"
+  check "killed install ($how): status says the install did not finish (exit 4)" test "$(status_rc "$P53")" = 4 -a -n "$(grep 'install) did not finish' "$T/status.log")"
+  if [ "$how" = rerun ]; then
+    inst --apply "$P53" > "$T/i53.log" 2>&1 || { cat "$T/i53.log"; bad "p53 install rerun"; }
+    check "killed install: a rerun completes it, healthy" test "$(status_rc "$P53")" = 0
+  fi
+  uninst --apply "$P53" > "$T/u53.log" || { cat "$T/u53.log"; bad "p53 uninstall exit"; }
+  check "killed install ($how), then uninstall: directory (settings bytes included) and registry as before" test "$before" = "$(state "$P53")"
+done
+
+echo "== runs in two directories queue on Claude Code's plugin registry"
+P54="$T/p54"; mkdir -p "$P54"; git -C "$P54" init -q
+flock "$CLAUDE_CONFIG_DIR" sleep 8 & lp=$!; sleep 1
+t0=$SECONDS; inst --apply "$P54" > "$T/l54.log" 2>&1 || { cat "$T/l54.log"; bad "p54 install exit"; }; took=$((SECONDS - t0)); wait "$lp" || true
+check "registry lock: a second run waits for the first" test "$took" -ge 6 -a "$(grep -c 'waiting for another devproc run' "$T/l54.log")" = 1
+check "registry lock: then it completes, healthy" test "$(status_rc "$P54")" = 0
+uninst --apply "$P54" > /dev/null || bad "p54 uninstall exit"
 
 echo "== nothing of devproc left in the registry"
 check "no devproc marketplace registered" test -z "$(registered | grep '^devproc' || true)"

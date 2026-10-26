@@ -1,6 +1,6 @@
 {
   "name": "devproc",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "General dev procedure: push and DB guards, leak scan, and skills for baseline, verify, decisions, mistakes, presentation and close.",
   "author": {
     "name": "AnapatAut"

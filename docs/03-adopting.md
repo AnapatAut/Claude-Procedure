@@ -49,32 +49,35 @@ Requirements: `python3` 3.8 or later, `git`, and the Claude Code CLI. Tested on 
 - **Before writing anything:**
   - the guard self-test must pass, and must fail on a do-nothing fake guard;
   - `claude plugin validate` must pass.
-- **Install, upgrade and repair roll back** when a step fails or the run is interrupted: files are restored, new snapshots and created directories removed, and the plugin and marketplace entries undone or pointed back.
-  - A failed undo is reported as `rollback INCOMPLETE` (exit 3).
-- **One run at a time** per directory; a second `--apply` run is refused.
-- **A killed run** (SIGKILL, power loss) cannot roll back; Ctrl-C, SIGTERM and SIGHUP (terminal closed, ssh dropped) do, and a run under `nohup` keeps going. A second signal during the rollback is ignored, and a running `claude` call is let finish first. After a kill, install refuses while devproc's leftovers are there (a plugin snapshot, a registered marketplace, enabled plugin entries) and prints the command that removes each. devproc's marked git exclude lines are taken back by the next install. Rule files left behind count as the project's own afterwards: delete them by hand if you do not want them.
-- **Uninstall does not roll back.** It stops at a failed step and can be rerun to finish.
+- **No rollback, as dpkg.** Each run first writes its manifest, marked pending, with everything it will do. If a step fails, or the run is interrupted or killed (SIGKILL, power loss), it stops part-way (exit 3): rerun the same command to finish it, or run uninstall to remove it. `--status` says when a run did not finish.
+  - Every file write is atomic: a kill leaves a file's old bytes or its new ones, never a cut file.
+  - The first Ctrl-C, SIGTERM or SIGHUP (terminal closed, ssh dropped) stops the run after the current step; a second stops it at once. A running `claude` call is never killed: it finishes by itself. A run under `nohup` keeps going.
+  - After a kill of devproc 0.2.1 or older (which had no pending manifest), install refuses while its leftovers are there (a plugin snapshot, a registered marketplace, enabled plugin entries) and prints the command that removes each. devproc's marked git exclude lines are taken back by the next install.
+- **One run at a time** per directory; a second `--apply` run is refused. Runs in different directories wait for each other on Claude Code's plugin registry.
+- **Uninstall works from any state with a manifest**, an unfinished install included. It stops at a failed step and can be rerun to finish.
   - It keeps files the project changed and all task data, and lists every kept file.
-  - It keeps the git exclude lines for kept files, so evidence is not committed by accident.
+  - It keeps the git exclude lines for kept files, so evidence is not committed by accident. The marker above each kept line names this directory, so another install that shares the exclude file (a worktree, or a linked file) never removes it.
   - It removes this directory's own marketplace and snapshots. Other directories are not touched, also when this directory is a copy of another. Uninstalling an original does remove the marketplace that its never-repaired copies borrow: repair those copies first.
 
-## Test evidence (2026-10-25, version 0.2.1)
+## Test evidence (2026-10-26, version 0.2.2)
 
 | Test | Result |
 |---|---|
 | Guard self-test, `tests/selftest.py` | 91/91 cases pass |
 | Same test against a do-nothing fake guard | fails, as required |
 | Same test against the first, unpublished guard version (0.1.0) | 22 of the 84 cases of the time fail: each one is a gap the review found and 0.2.0 fixes |
-| Installer end-to-end, `tests/installer-e2e.sh`: sandbox config, throwaway dirs, real sessions' debug logs | 331/331 checks pass (details below) |
-| Same e2e test against 78 installer mutants, each with one safeguard switched off (`tests/installer-mutants.py`) | each is caught by the check written for it |
+| Installer end-to-end, `tests/installer-e2e.sh`: sandbox config, throwaway dirs, real sessions' debug logs | 440/440 checks pass (details below) |
+| Kill sweep, `tests/installer-killsweep.sh`: install, upgrade and uninstall each killed (SIGKILL) before every step | 190/190 checks pass: the project's data intact, a rerun finishes, uninstall leaves the directory byte-identical |
+| Same e2e test against 106 installer mutants, each with one safeguard switched off (`tests/installer-mutants.py`) | 106/106 caught, each by its own expected check |
 | Live logged-in session (0.2.1) in a throwaway directory, push of a commit with a fake AWS key | the hook ran from the directory's snapshot (`…/.claude/devproc/dist/0.2.1/plugin/scripts/guard.py`) and denied the push; nothing pushed; after uninstall the real `settings.json`, `installed_plugins.json` and `known_marketplaces.json` are byte-identical |
 | Live interactive session (guard 0.1.0), plugin loaded, `/usr/bin/git push` (a spelling simple permission rules miss) | Claude Code stopped with "Hook PreToolUse:Bash requires confirmation … devproc (P17)"; declined; nothing pushed |
 | Live `claude -p` session (guard 0.2.0), `bash -c 'git push origin HEAD:main'` with a fake AWS key in the commit | denied: "leak scan found 1 hit(s) (1 commit(s) not on remote origin scanned): … cfg.py:1 [aws-access-key-id]", key not printed; nothing pushed |
 | Real user config after all tests | unchanged (hashes compared) |
 | Fresh-context review of all docs against the code | 25 findings; all fixed or documented here |
 | Eleven fresh-context reviews of the 0.2.1 installer | 72 defects found, the last review none; all fixed |
+| Eight fresh-context reviews of the 0.2.2 installer | 22 issues found and fixed; the eighth found one rare case, accepted as a known limit (below) |
 
-The 331 installer checks cover:
+The 440 installer checks cover:
 - a dry run writes nothing;
 - install, then a second install, changes nothing the second time;
 - status reports which files the project changed;
@@ -85,9 +88,9 @@ The 331 installer checks cover:
 - a file identical to a template is kept on uninstall;
 - it refuses `$HOME`, `/`, its own folder (also through a symlink), a missing directory, a repo subdirectory and a linked worktree, each with its message;
 - a second run on a locked directory is refused; bad arguments exit 2; a broken manifest or a missing `claude` gives a clean message;
-- a failed install rolls back fully, also while another directory has devproc installed, and also when the step that failed had done part of its work;
+- a failed install stops with exit 3 and leaves a pending manifest; status reports it; a rerun finishes it (also when the failed step had done part of its work), and uninstall instead leaves the directory and the registry exactly as before; another installed directory keeps working;
 - a `settings.local.json` that existed before install is byte-identical after uninstall;
-- a failed upgrade restores the files it replaced;
+- a failed upgrade stops after updating a rule, which still counts as devproc's; a rerun finishes the upgrade; an upgrade killed before it updates a rule leaves the rule counted as devproc's, and a rerun updates it;
 - a failed uninstall stops honestly and a rerun finishes it;
 - removing devproc from one directory leaves another directory working;
 - a source change reaches a directory only through `--upgrade`;
@@ -97,25 +100,32 @@ The 331 installer checks cover:
 - going back to the kept previous version reuses its snapshot; older snapshots are pruned, and an upgrade to the same version prunes none;
 - a stray file or symlink in the snapshot folder is removed on uninstall, and the link's target is left alone;
 - a damaged, missing or disabled install, a tampered snapshot `marketplace.json`, a symlink added to the snapshot, git exclude lines removed, a moved or copied project, and a marketplace name taken by another folder: `--status` reports each, `--repair` fixes each, and repair refuses a source at another version or with other code;
-- a failed repair rolls back to exactly the state before it, registry included;
+- a failed repair (also of a moved, copied or hijacked install) stops, and a rerun finishes it; a snapshot it moved aside is removed then; a copy's stopped repair followed by uninstall removes the copy's own records and leaves the original working;
 - a moved directory with a newer source: `--repair` refuses and points to `--upgrade`, which upgrades it, gives it a marketplace named for its new place and removes the old folder's dead registration;
 - an installed directory copied into another repo: repair and upgrade refuse, and uninstall leaves that repo's exclude file alone;
 - a git exclude file without a newline at its end keeps its last pattern working, and is byte-identical after uninstall;
-- a failed install in a directory with a `settings.local.json` (CRLF line ends) restores it byte for byte; so does install then uninstall;
+- a failed install in a directory with a `settings.local.json` (CRLF line ends), then uninstall, restores it byte for byte; so does install then uninstall; so does a kill right after `claude plugin install` changed it, followed by a rerun and uninstall, or by uninstall alone;
 - a manifest or `settings.local.json` of the wrong JSON type gives a clean message, never a traceback;
 - uninstalling a copy, or a moved folder, that was never repaired: the original's exclude file, git status and install stay as they were, and the copy's own records (subdirectories too) are removed;
 - dry runs of install, upgrade, repair and uninstall write nothing;
-- a 0.2.0 install (made with the real 0.2.0 installer) is migrated by `--upgrade`, while another 0.2.0 directory keeps working; its subdirectory records are removed; a failed migration rolls back to the working 0.2.0 install; a migration is refused when the project had the plugin before devproc;
+- a 0.2.0 install (made with the real 0.2.0 installer) is migrated by `--upgrade`, while another 0.2.0 directory keeps working; its subdirectory records are removed; a failed migration stops and a rerun finishes it; a migration is refused when the project had the plugin before devproc;
 - this uninstaller removes a 0.2.0 install, keeping the shared marketplace while another 0.2.0 directory uses it;
-- a closed terminal (SIGHUP to the whole process group) and Ctrl-C: the running `claude` call finishes, and a second signal during the rollback does not cut it short;
-- a step fails and SIGHUP arrives during its undo: the rollback still completes;
-- a hung `claude` call is stopped at the timeout with the processes it started, even when one of them left its process group and still holds the output;
+- SIGHUP: the run stops after the current step (which finishes), and a rerun finishes the install; a closed terminal (SIGHUP to the whole process group) or Ctrl-C twice: devproc stops at once, the `claude` call it left still finishes by itself, and a rerun finishes the install;
+- an interrupt while waiting for another run's registry lock stops at once with nothing changed; a run in another directory waits for that lock;
+- a `kill -9` in the middle of a manifest or exclude-file write leaves the old bytes; the temp file left is reported by status and removed by the next run; an uninstall killed half way is reported, install refuses until it is finished, and a rerun finishes it; an install killed between two file copies is finished by a rerun;
+- a hung `claude` call is stopped at the timeout with the processes it started, even when one of them left its process group; the run stops, and uninstall then leaves the directory as before;
 - an interrupt while an upgrade tidies up keeps the upgrade and names the tidying step not done, and only that one;
 - a closed output pipe (`| head`) stops neither install nor uninstall;
 - git answering in another language or in git 1.x wording, and a `GIT_DIR` set by the caller: the target is judged by its own repository, and the other repository is untouched;
 - the remove command printed for a leftover works for a path with a quote in it;
 - install over a 0.2.0 marker joined to the project's last pattern splits it off;
 - a `.claude` symlinked to another directory's install: uninstall refuses, status exits 4, and the other install is untouched;
+- a copy of an install in a linked worktree, and the main checkout, each keep the exclude lines the other relies on, in either order of uninstall; so do repositories whose exclude files link to one file; lines kept for files left behind survive another install's uninstall;
+- a `.git/info/exclude` kept as a symlink stays a symlink; a worktree whose `.claude` links to the main checkout's does not hold the main checkout's lines;
+- a non-UTF-8 exclude line, and a `settings.local.json` with non-ASCII text under a Latin-1 locale, come back byte for byte;
+- install, Claude Code adding a permission, uninstall, reinstall, uninstall: the settings file stays ignored;
+- repair finishing a stopped upgrade refuses a symlinked rule file;
+- a daemon a `claude` call starts does not hold devproc's locks;
 - at the end, no devproc marketplace or plugin record is left in the registry.
 
 ## Cost
@@ -129,6 +139,7 @@ The 331 installer checks cover:
 - Hooks and rules are best-effort, as the Claude Code docs say.
 - **A moved or copied project folder:** until `--repair`, a moved folder runs without devproc (Claude Code reports `failed to load`), and a copy runs the original's snapshot. `--status` names the problem.
   - A session started in a moved folder before the repair leaves a record of the old plugin id there. Its marketplace folder is gone, so a failed repair cannot reinstall it; the repair removes it as a last tidying step instead.
+- **A shared exclude file with a line an older devproc kept** (rare): in repositories sharing one `.git/info/exclude` (a linked file, or a 0.2.0/0.2.1 main checkout with a worktree copy), a line that a 0.2.0 or 0.2.1 uninstall kept for task data left behind is adopted by a 0.2.2 install in another of them, and removed by its uninstall. That task data is then no longer ignored: `git status` shows `?? .claude/devproc/…`. Add `/.claude/devproc/` back to the exclude file, or remove the old task data.
 - **Tested with Claude Code 2.1.310.** The post-check relies on `readFromFolder` in `claude plugin list --json`.
 - **Platforms:** tested on Linux only.
 - **Pushes it cannot see:** a push inside a script file, a `gh` command that pushes, or a shell alias or function. Git aliases are seen.

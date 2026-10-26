@@ -17,14 +17,15 @@ Safety rules:
   - inside git, TARGET must be the top level of the main checkout (Claude Code keeps
     local plugin settings there);
   - the guard self-test must pass, and must fail on a mutant, before anything is written;
-  - install, upgrade and repair roll back on a failed step; uninstall stops and can be rerun;
+  - as dpkg: no rollback. The first step writes the manifest, marked pending, with everything
+    the run will do; a run that fails, is interrupted or is killed stops part-way, and
+    rerunning it finishes it, or uninstall removes it. Every file write is atomic;
   - one run at a time per directory; running install twice changes nothing.
-Exit codes: 0 done (status: healthy), 1 refused or failed and rolled back (status: not
-installed), 2 usage, 3 rollback incomplete, uninstall stopped, or unexpected error,
-4 status found problems.
+Exit codes: 0 done (status: healthy), 1 refused, nothing changed (status: not installed),
+2 usage, 3 stopped part-way (a failed step, an interrupt, an unexpected error): rerun to
+finish, 4 status found problems.
 stdlib only. devproc itself makes no network calls (the `claude` CLI is Claude Code's own).
 """
-import contextlib
 import errno
 import fcntl
 import hashlib
@@ -34,14 +35,16 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 SRC = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 PLUGIN = os.path.join(SRC, "plugin")
 TPL = os.path.join(PLUGIN, "templates")
-VERSION = json.load(open(os.path.join(PLUGIN, ".claude-plugin", "plugin.json")))["version"]
+VERSION = json.load(open(os.path.join(PLUGIN, ".claude-plugin", "plugin.json"), encoding="utf-8"))["version"]
 LAYOUT = 2
 MANIFEST = ".claude/devproc/manifest.json"
 SETTINGS_LOCAL = ".claude/settings.local.json"
@@ -49,6 +52,13 @@ DIST = ".claude/devproc/dist"
 EXCLUDE_PATHS = [".claude/devproc/", ".claude/rules/devproc/", SETTINGS_LOCAL]
 DIRS = [".claude", ".claude/rules", ".claude/rules/devproc", ".claude/devproc", DIST]
 MARK = "# devproc: added by devproc install.sh, removed by uninstall.sh"
+# what an uninstall puts in place of MARK above a line it keeps for files left behind: no other
+# install's uninstall removes it (it removes only pairs under MARK), and a reinstall in the same
+# directory takes it back
+KEPT = "# devproc: kept by uninstall.sh for files left in %s; delete this line and the next once they are gone"
+# a pending manifest's "previous": the install as it was before the run, which a rerun converges from
+PREVIOUS_KEYS = ("version", "pluginHash", "marketplaceJson", "marketplace", "pluginId", "dist", "projectPath")
+TMP_TAG = ".devproc-tmp"  # atomic_write's temp files: "." + name + "." + random + TMP_TAG
 MAX_LISTED = 20
 CLI_TIMEOUT = 300  # DEVPROC_CLI_TIMEOUT overrides it
 # git's variables that name a repository (git rev-parse --local-env-vars, less the config ones): set
@@ -101,7 +111,7 @@ def tree_hash(root):
 
 
 def say(msg):
-    """Print a line. A gone terminal (ssh dropped, `| head` closed) must not stop a rollback: on the
+    """Print a line. A gone terminal (ssh dropped, `| head` closed) must not stop a run: on the
     first failed write (EIO, EPIPE), output goes to /dev/null and the run carries on."""
     try:
         print(msg, flush=True)
@@ -125,88 +135,64 @@ class Fail(Exception):
 
 
 # Ctrl-C, SIGTERM and SIGHUP (main installs interrupted() for each one not ignored, as nohup
-# ignores SIGHUP). The first raises KeyboardInterrupt, which starts the rollback; from then on they
-# are held: a second one (closing a terminal can send SIGHUP twice) would cut the rollback short.
-# Inside steady() an interrupt waits until the block ends.
-SIGNALS = {"held": False, "steady": 0, "pending": False}
+# ignores SIGHUP). The first only counts: the run stops before its next step (Plan.execute), so it
+# ends between two steps. A second one (closing a terminal can send SIGHUP twice) stops it at once.
+# Both leave a state a rerun finishes: every write is atomic, and the manifest was written first.
+INTERRUPTS = {"n": 0}
+# the descriptors holding devproc's locks (lock, lock_config). Each `claude` call runs under HOLD, a
+# small Python process that inherits them and closes them for `claude` itself: a call left running when
+# devproc stops at once keeps the locks until it ends, so no new run starts beside it, and a daemon that
+# `claude` starts (it can start one that lives for days) never holds them.
+LOCKS = []
+HOLD = "import subprocess, sys; sys.exit(subprocess.call(sys.argv[1:]))"
 
 
 def interrupted(signum, frame):
-    if SIGNALS["held"]:
-        return
-    if SIGNALS["steady"]:
-        SIGNALS["pending"] = True
-        return
-    SIGNALS["held"] = True
-    raise KeyboardInterrupt
-
-
-@contextlib.contextmanager
-def steady():
-    """A block an interrupt must not cut: a file rewrite (cut after the truncate, the file would be
-    left empty) or a process start (cut before Popen returns, the child would run unwatched)."""
-    SIGNALS["steady"] += 1
-    try:
-        yield
-    finally:
-        SIGNALS["steady"] -= 1
-    if not SIGNALS["steady"] and SIGNALS["pending"]:
-        SIGNALS["pending"] = False
-        if not SIGNALS["held"]:  # held: a rollback has started, which no interrupt may cut
-            SIGNALS["held"] = True
-            raise KeyboardInterrupt
+    INTERRUPTS["n"] += 1
+    if INTERRUPTS["n"] > 1:
+        raise KeyboardInterrupt
+    try:  # os.write, not print: a print here could hit the buffered stream mid-write
+        os.write(2, b"\ndevproc: interrupted: stopping after the current step (interrupt again to stop at once)\n")
+    except OSError:
+        pass
 
 
 def stop(p):
-    """Kill p and what it started (its own process group), and reap it: a grandchild still holding
-    the output pipes must not keep devproc waiting."""
+    """Kill p and what it started (its own process group), and reap it."""
     try:
         os.killpg(p.pid, signal.SIGKILL)
     except OSError:
         pass
     try:
-        p.communicate(timeout=5)
+        p.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        p.stdout.close()
-        p.stderr.close()
-        p.wait()
+        pass
 
 
 def run(args, cwd=None, check=True):
     env = {k: v for k, v in os.environ.items() if k not in GIT_REPO_VARS}
     if args[0] == "git":
         env.update(LC_ALL="C", LANGUAGE="")  # its messages are matched below ("not a git repository")
-    # A session of its own: a terminal's Ctrl-C or hangup reaches devproc only, and an interrupt lets
-    # the call finish before devproc rolls back. Killing `claude` mid-call could leave the plugin
-    # registry that every directory shares half written.
-    p = None
-    timed_out = False
-    try:
-        with steady():
-            try:
-                p = subprocess.Popen(args, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                     stderr=subprocess.PIPE, text=True, env=env, start_new_session=True)
-            except OSError as e:
-                raise Fail("`%s` could not run: %s" % (" ".join(args), e))
-        out, err = p.communicate(timeout=CLI_TIMEOUT)
-    except KeyboardInterrupt:
-        if p is not None and p.poll() is None:
-            say("  interrupted: letting `%s` finish first (up to %d s); further interrupts are ignored"
-                % (" ".join(args[:4]), CLI_TIMEOUT))
-            try:
-                p.communicate(timeout=CLI_TIMEOUT)
-            except subprocess.TimeoutExpired:
-                pass
-        raise
-    except subprocess.TimeoutExpired:
-        timed_out = True
-    finally:
-        if p is not None and p.poll() is None:  # timed out, or an interrupt landed before the wait
-            with steady():
-                stop(p)
-    if timed_out:
-        raise Fail("`%s` did not finish within %d s" % (" ".join(args), CLI_TIMEOUT))
-    r = subprocess.CompletedProcess(args, p.returncode, out, err)
+    # A session of its own: a terminal's Ctrl-C or hangup reaches devproc only. Output goes to
+    # unnamed temp files, not pipes: devproc stopped at once (a second interrupt) leaves the call to
+    # finish by itself, which a closed pipe would kill mid-write of the plugin registry every
+    # directory shares; and a grandchild holding the output cannot keep devproc waiting.
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        try:
+            argv = [sys.executable, "-I", "-c", HOLD] + args if args[0] == "claude" else args
+            p = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=out, stderr=err, env=env,
+                                 start_new_session=True, pass_fds=LOCKS if args[0] == "claude" else ())
+        except OSError as e:
+            raise Fail("`%s` could not run: %s" % (" ".join(args), e))
+        try:
+            p.wait(timeout=CLI_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            stop(p)
+            raise Fail("`%s` did not finish within %d s" % (" ".join(args), CLI_TIMEOUT))
+        out.seek(0)
+        err.seek(0)
+        r = subprocess.CompletedProcess(args, p.returncode, out.read().decode("utf-8", "replace"),
+                                        err.read().decode("utf-8", "replace"))
     if check and r.returncode != 0:
         raise Fail("`%s` exit %d: %s" % (" ".join(args), r.returncode,
                                         (r.stderr or r.stdout).strip()[:400]))
@@ -214,38 +200,90 @@ def run(args, cwd=None, check=True):
 
 
 def read_json(path):
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:  # JSON is UTF-8 (RFC 8259), whatever the locale says
         return json.load(f)
+
+
+def failpoint(name):
+    """Test hook: with DEVPROC_FAILPOINT=<name>, the run SIGKILLs itself here, as kill -9, the OOM
+    killer or a power cut would. Used by tests/installer-e2e.sh; does nothing otherwise."""
+    if os.environ.get("DEVPROC_FAILPOINT") == name:
+        os.kill(os.getpid(), signal.SIGKILL)
+
+
+def fsync_dir(d):
+    fd = os.open(d, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def atomic_write(path, data):
+    """Replace path's content with the bytes data: written to a temp file in the same folder, fsynced,
+    renamed over path, and the folder fsynced (rename(2), fsync(2)). A kill, a power cut or a full
+    disk at any point leaves the old bytes or the new ones, never a cut file. path keeps its mode; a
+    new file gets the umask's. A killed run can leave a temp file, which the next run removes.
+    A symlink at path is written through, as open() would: the rename replaces the file it points
+    to, so a .git/info/exclude kept as a link into a dotfiles repo stays a link."""
+    path = os.path.realpath(path)
+    d = os.path.dirname(path) or "."
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+    except FileNotFoundError:
+        um = os.umask(0)
+        os.umask(um)
+        mode = 0o666 & ~um
+    fd, tmp = tempfile.mkstemp(dir=d, prefix="." + os.path.basename(path) + ".", suffix=TMP_TAG)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fchmod(f.fileno(), mode)
+            os.fsync(f.fileno())
+        failpoint("write:" + os.path.basename(path))
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.lexists(tmp):
+            os.remove(tmp)
+        raise
+    fsync_dir(d)
 
 
 def write_json(path, data):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with steady(), open(path, "w") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
+    atomic_write(path, (json.dumps(data, indent=2) + "\n").encode("utf-8"))
 
 
 # ------------------------------------------------------------------ plan / apply
 
 class Plan:
-    """Ordered steps. rollback=True: a failed step is undone (its own partial work, then every
-    completed step, in reverse). rollback=False (uninstall): a failed step stops the run;
-    rerunning finishes it. A step added with warn=True is tidying after the work is done: its
-    failure is reported and never rolled back."""
+    """Ordered steps, with no undo, as dpkg runs them. A step that fails, or an interrupt, stops the
+    run after the step it was in (exit 3); the steps before it stay done. Rerunning the same command
+    finishes it, so every step must be safe to run again; uninstall removes it, since the first step
+    wrote a manifest naming everything the run may do. A step added with warn=True is tidying after
+    the work is done, or work that is safe to skip: its failure is reported and the run carries on,
+    and an interrupt does not stop the run before it."""
 
-    def __init__(self, apply, rollback=True):
+    def __init__(self, apply, uninstall=False):
         self.apply = apply
-        self.rollback = rollback
+        self.uninstall = uninstall
         self.steps = []
         self.notes = []
 
-    def add(self, desc, do, undo=None, warn=False):
-        if self.rollback and not warn and any(s[3] for s in self.steps):
-            raise ValueError("a step after a tidying step could not be rolled back: %s" % desc)
-        self.steps.append((desc, do, undo, warn))
+    def add(self, desc, do, warn=False):
+        self.steps.append((desc, do, warn))
 
     def note(self, msg):
         self.notes.append(msg)
+
+    def stopped(self, i, why):
+        """The Fail for a run stopped at step i: steps before it are done and kept."""
+        done = ("nothing was changed" if i == 1 else "step 1 is done and kept" if i == 2
+                else "steps 1 to %d are done and kept" % (i - 1))
+        how = ("Rerun the same command to finish it" if self.uninstall else
+               "Rerun the same command to finish it, or uninstall.sh --apply to remove it")
+        return Fail("%s at step %d/%d; %s. %s: it is safe to rerun." % (why, i, len(self.steps), done, how), 3)
 
     def execute(self):
         tag = "" if self.apply else "[dry-run] "
@@ -254,61 +292,25 @@ class Plan:
         if not self.steps:
             say("  nothing to do")
             return
-        done = []
-        current = None  # the step running now: its own partial work is undone first
-        tidying = 0  # the first tidying step's number, once reached: tidying may have removed what an undo needs
-        at = 0
-        try:
-            for i, (desc, do, undo, warn) in enumerate(self.steps, 1):
-                current = None
-                at = i
-                if warn and self.rollback and self.apply and not tidying:
-                    tidying = i
-                say("  %s[%d/%d] %s" % (tag, i, len(self.steps), desc))
-                if not self.apply:
-                    continue
-                if warn:
-                    try:
-                        do()
-                    except Exception as e:
-                        say("  warning: this step failed (%s). The work before it is done and kept; "
-                            "do this step by hand." % e)
-                    at = i + 1  # done (or reported): not listed as not done
-                    continue
-                current = (desc + " (partial)", undo)
+        for i, (desc, do, warn) in enumerate(self.steps, 1):
+            if INTERRUPTS["n"] and not warn:  # a warn step is quick tidying, or work that is safe to skip: it runs
+                raise self.stopped(i, "interrupted: stopped before the step")
+            say("  %s[%d/%d] %s" % (tag, i, len(self.steps), desc))
+            if not self.apply:
+                continue
+            failpoint("step:%d" % i)  # killed before step i: a rerun or an uninstall must finish it
+            try:
                 do()
-                done.append((desc, undo))
-                current = None
-        except (Exception, KeyboardInterrupt) as e:
-            SIGNALS["held"] = True  # no interrupt may cut the rollback (or the report of a stop) short
-            if tidying:
-                left = [d for d, _, _, w in self.steps[at - 1:] if w]
-                say(("  interrupted while tidying up: the work is done and kept" if isinstance(e, KeyboardInterrupt)
-                     else "  warning: tidying stopped (%s). The work is done and kept" % e)
-                    + ("; these tidying steps were not done, or not confirmed done: check each and do it by hand"
-                       " if needed:" if left else "."))
-                for d in left:
-                    say("    not done: " + d)
-                return
-            say("  FAILED: %s" % (e if not isinstance(e, KeyboardInterrupt) else "interrupted"))
-            if not self.rollback:
-                raise Fail("stopped at the failed step; %d step(s) were done and are not undone. "
-                           "Fix the cause and rerun the same command: it is safe to rerun." % len(done), 3)
-            say("  rolling back %d step(s)" % len(done))
-            failed = 0
-            for d, u in ([current] if current else []) + list(reversed(done)):
-                if not u:
+            except Exception as e:
+                if warn:
+                    say("  warning: this step failed (%s). The work before it is done and kept; "
+                        "do this step by hand." % e)
                     continue
-                try:
-                    u()
-                    say("    undone: " + d)
-                except (Exception, KeyboardInterrupt) as e2:
-                    failed += 1
-                    say("    UNDO FAILED (%s): %s" % (d, e2 if not isinstance(e2, KeyboardInterrupt) else "interrupted"))
-            if failed:
-                raise Fail("rollback INCOMPLETE: %d undo step(s) failed, see UNDO FAILED above" % failed, 3)
-            raise Fail("rolled back; nothing from this run is left")
-        if not self.apply:
+                say("  FAILED: %s" % e)
+                raise self.stopped(i, "stopped: this step failed (it may be partly done)")
+        if self.apply:
+            failpoint("step:%d" % (len(self.steps) + 1))
+        else:
             say("dry run only. Rerun with --apply to do it.")
 
 
@@ -428,13 +430,28 @@ def leftovers(target):
     return out
 
 
-def marked_lines(ex_file):
-    """Lines under a devproc marker in ex_file: devproc's own, from an earlier install whose
-    uninstall kept them (files stayed behind) or a killed run."""
+def kept_mark(target):
+    return KEPT % target.replace("\n", "?")
+
+
+def marked_lines(ex_file, target):
+    """Lines under a devproc marker in ex_file: devproc's own, from a killed run, or kept for files
+    left in target by an earlier uninstall there."""
     if not os.path.exists(ex_file):
         return set()
-    l = open(ex_file, newline="").read().split("\n")
-    return {l[i + 1] for i in range(len(l) - 1) if l[i].endswith(MARK)}
+    l = open(ex_file, encoding="utf-8", errors="surrogateescape", newline="").read().split("\n")
+    return {l[i + 1] for i in range(len(l) - 1) if l[i].endswith(MARK) or l[i] == kept_mark(target)}
+
+
+def kept_for_others(ex_file, target):
+    """Lines in ex_file kept by an uninstall of another directory (under its KEPT marker). They make
+    git ignore the path, but that directory's owner may delete them at any time: an install here
+    adds a pair of its own instead of relying on them."""
+    if not os.path.exists(ex_file):
+        return set()
+    l = open(ex_file, encoding="utf-8", errors="surrogateescape", newline="").read().split("\n")
+    head = KEPT.split("%s")[0]
+    return {l[i + 1] for i in range(len(l) - 1) if l[i].startswith(head) and l[i] != kept_mark(target)}
 
 
 def load_manifest(target):
@@ -465,6 +482,12 @@ def load_manifest(target):
         wrong.append("exclude")
     if not isinstance(m.get("createdDirs", []), list):
         wrong.append("createdDirs")
+    if not isinstance(m.get("pending", ""), str):
+        wrong.append("pending")
+    if not isinstance(m.get("previous", {}), dict) or not all(
+            isinstance(m["previous"].get(k), dict if k == "marketplaceJson" else str)
+            for k in PREVIOUS_KEYS if k in m.get("previous", {}) and isinstance(m["previous"], dict)):
+        wrong.append("previous")
     if wrong:
         raise Fail(bad % ("has a wrong type for " + ", ".join(wrong)))
     return m
@@ -635,6 +658,8 @@ def required_ignores(m):
     and settings.local.json if devproc added its exclude line (it holds absolute local paths).
     The rules folder is not required: a team may commit it (docs/02-how-it-works.md)."""
     lines = [l.lstrip("/").rstrip("/") for l in (m.get("exclude") or {}).get("lines", [])]
+    if m.get("pending") == "install":  # finishing an install: every line it set out to add
+        return [p for p in EXCLUDE_PATHS if p == ".claude/devproc/" or p.rstrip("/") in lines]
     return [p for p in (".claude/devproc/", SETTINGS_LOCAL) if p == ".claude/devproc/" or p in lines]
 
 
@@ -647,12 +672,13 @@ def current_exclude(target, m):
     g = git_top(target)
     if not ex or not g:
         return None
-    lines = ["/" + os.path.relpath(os.path.join(target, l.lstrip("/").rstrip("/")), g[0]) + ("/" if l.endswith("/") else "")
-             for l in ex["lines"]]
+    here = lambda ls: ["/" + os.path.relpath(os.path.join(target, l.lstrip("/").rstrip("/")), g[0])
+                       + ("/" if l.endswith("/") else "") for l in ls]
     f = git_exclude_file(target)
-    out = dict(ex, file=f, lines=lines)
+    out = dict(ex, file=f, lines=here(ex["lines"]), adopted=here(ex.get("adopted", [])))
     if (not isinstance(ex.get("file"), str)
-            or os.path.relpath(f, target) != os.path.relpath(ex["file"], m.get("projectPath", target))):
+            or (os.path.realpath(ex["file"]) != os.path.realpath(f)
+                and os.path.relpath(f, target) != os.path.relpath(ex["file"], m.get("projectPath", target)))):
         # another exclude file now (the folder sits in another repo, or was moved without its .git):
         # the record of what devproc created or added in the old one says nothing about this one
         out.update(newlineBefore=None, fileCreated=False, dirCreated=False)
@@ -683,6 +709,9 @@ def health(target, m):
     elif e.get("errors"):
         out.append(("Claude Code reports load errors for %s: %s" % (m["pluginId"], "; ".join(map(str, e["errors"]))),
                     "--repair"))
+    tmp = stale_temp_files(target)
+    if tmp:
+        out.append(("%d temp file(s) a killed run left: %s" % (len(tmp), ", ".join(tmp)), "--repair"))
     if git_top(target):
         for p in required_ignores(m):
             if p == SETTINGS_LOCAL and tracked(target, p):
@@ -727,6 +756,21 @@ def remove_tree(path):
     shutil.rmtree(path)
 
 
+def fsync_tree(root):
+    """fsync every file and folder under root (symlinks are not followed), so a renamed snapshot is
+    complete on disk."""
+    for d, dirs, names in os.walk(root):
+        for n in names:
+            p = os.path.join(d, n)
+            if not os.path.islink(p):
+                fd = os.open(p, os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+        fsync_dir(d)
+
+
 def build_snapshot(dst, name):
     """Copy plugin/ to dst/plugin, write dst/.claude-plugin/marketplace.json named `name`,
     check the copy against the source, validate it, and make it read-only. Leaves nothing
@@ -744,8 +788,10 @@ def build_snapshot(dst, name):
         if tree_hash(os.path.join(tmp, "plugin")) != tree_hash(PLUGIN):
             raise Fail("the snapshot copy does not match the source")
         run(["claude", "plugin", "validate", tmp])
+        fsync_tree(tmp)
         os.rename(tmp, dst)  # rename first: Linux may refuse to move a directory that is not writable
         renamed = True
+        fsync_dir(os.path.dirname(dst))
         make_readonly(dst)
     except BaseException:
         remove_tree(tmp)
@@ -755,39 +801,35 @@ def build_snapshot(dst, name):
 
 
 def snapshot_action(plan, dst, name):
-    state = {}
-
     def do():
         if os.path.lexists(dst):
             raise Fail("%s already exists" % dst)
-        state["ours"] = True
         build_snapshot(dst, name)
-
-    def undo():  # never removes a snapshot this step did not write
-        if state.get("ours"):
-            remove_tree(dst)
-    plan.add("write read-only plugin snapshot %s (marketplace %s)" % (dst, name), do, undo)
+    plan.add("write read-only plugin snapshot %s (marketplace %s)" % (dst, name), do)
 
 
-def settings_backup(target):
-    """(do, undo) pair: do saves settings.local.json, undo restores those exact bytes.
-    undo does nothing if do never ran."""
-    sl = os.path.join(target, SETTINGS_LOCAL)
-    state = {}
+def temp_cleanup_action(plan, target):
+    tmp = stale_temp_files(target)
+    if tmp:
+        plan.add("remove %d temp file(s) a killed run left: %s" % (len(tmp), ", ".join(tmp)),
+                 lambda: [os.remove(p) for p in tmp if os.path.lexists(p)])
 
-    def save():
-        state["old"] = open(sl, "rb").read() if os.path.exists(sl) else None
 
-    def restore():
-        if "old" not in state:
-            return
-        if state["old"] is None:
-            if os.path.exists(sl):
-                os.remove(sl)
-        else:
-            with steady(), open(sl, "wb") as f:
-                f.write(state["old"])
-    return save, restore
+def stale_temp_files(target):
+    """atomic_write temp files a killed run left in the folders devproc writes."""
+    dirs = [os.path.join(target, d) for d in (".claude", ".claude/devproc", ".claude/rules/devproc")]
+    try:
+        ex = git_exclude_file(target) if git_top(target) else None
+    except Fail:
+        ex = None
+    if ex:
+        dirs += [os.path.dirname(ex), os.path.dirname(os.path.realpath(ex))]  # atomic_write writes through a link
+    return sorted(os.path.join(d, n) for d in dict.fromkeys(dirs) if os.path.isdir(d) and not os.path.islink(d)
+                  for n in os.listdir(d) if is_temp(n))
+
+
+def is_temp(name):
+    return name.startswith(".") and name.endswith(TMP_TAG)
 
 
 def drop_keys(target, name=None, pid=None):
@@ -824,98 +866,94 @@ def restore_original_settings(target, m):
         if k in cur and cur[k] == {} and k not in was:
             del cur[k]
     if cur == was:
-        with steady(), open(sl, "w", newline="") as f:
-            f.write(orig)
+        atomic_write(sl, orig.encode("utf-8"))
 
 
-def dirs_action(plan, target, created):
-    """Create the devproc directories; remember which ones did not exist."""
+def begin_action(plan, target, start, pending):
+    """The first step of every changing run, as dpkg marks a package half-installed before it
+    unpacks: create the missing devproc folders (start["mkdirs"]) and write the manifest
+    start["manifest"], marked "pending", with every record the run needs. The caller fills start in
+    while it plans, before anything runs. A run stopped at any later point is then finished by a
+    rerun, or removed by uninstall, from this manifest."""
     def do():
-        for d in DIRS:
+        for d in start.get("mkdirs", []):
             p = os.path.join(target, d)
             if not os.path.isdir(p):
                 os.mkdir(p)
-                created.append(d)
-
-    def undo():
-        for d in reversed(list(created)):
-            p = os.path.join(target, d)
-            if os.path.isdir(p) and not os.listdir(p):
-                os.rmdir(p)
-            created.remove(d)
-    plan.add("create missing directories under .claude/", do, undo)
+        write_json(os.path.join(target, MANIFEST), dict(start["manifest"], pending=pending))
+    plan.add("%swrite the manifest first, marked pending (%s)"
+             % ("create missing directories under .claude/ and " if pending == "install" else "", pending), do)
 
 
-def copy_action(plan, src, dst, files, origin, target=None, created=None):
-    """Copy src over dst. Undo restores the previous bytes (or removes dst if new), also after a
-    copy that stopped half way. Folders it has to create are added to created (relative to target)."""
-    state = {}
+def finish_action(plan, target, m):
+    """The last work step: the manifest without "pending" and the run's working records."""
+    final = {k: v for k, v in m.items() if k not in ("pending", "previous", "oldPluginInstalledByDevproc")}
+    final["files"] = {rel: {k: v for k, v in rec.items() if k != "was"} for rel, rec in m["files"].items()}
+    plan.add("write the final manifest %s (the run is complete)" % os.path.join(target, MANIFEST),
+             lambda: write_json(os.path.join(target, MANIFEST), final))
+
+
+def unchanged(rec, path):
+    """True if the file at path is as devproc left it: its recorded hash, or, while a run that
+    copies it is pending, its hash from before that run ("was"; the copy may not have run yet)."""
+    h = sha(path)
+    return h == rec["sha256"] or h == rec.get("was")
+
+
+def copy_action(plan, src, rel, target, files, created=None):
+    """Copy the template src to target/rel, recorded now, at plan time, with the template's hash and
+    "was", the file's hash before the run (None: no file), so the pending manifest matches the file
+    whether or not the copy has run. Folders it has to create are added to created."""
+    dst = os.path.join(target, rel)
+    files[rel] = {"sha256": sha(src), "origin": "seeded", "was": sha(dst) if os.path.exists(dst) else None}
+    d = os.path.dirname(rel)
+    while created is not None and d and not os.path.isdir(os.path.join(target, d)):
+        if d not in created:
+            created.append(d)
+        d = os.path.dirname(d)
 
     def do():
-        new_dirs, d = [], os.path.dirname(dst)
-        while not os.path.isdir(d):
-            new_dirs.insert(0, d)
-            d = os.path.dirname(d)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
-        state["new_dirs"] = new_dirs
-        if created is not None:
-            created.extend(os.path.relpath(d, target) for d in new_dirs)
-        state["old"] = open(dst, "rb").read() if os.path.exists(dst) else None
-        state["old_rec"] = files.get(dst)
-        state["started"] = True
-        shutil.copyfile(src, dst)
-        files[dst] = {"sha256": sha(dst), "origin": origin}
-
-    def undo():
-        if state.get("started"):
-            if state["old"] is None:
-                if os.path.exists(dst):
-                    os.remove(dst)
-            else:
-                with steady(), open(dst, "wb") as f:
-                    f.write(state["old"])
-            if state["old_rec"] is None:
-                files.pop(dst, None)
-            else:
-                files[dst] = state["old_rec"]
-        for d in reversed(state.get("new_dirs", [])):
-            if os.path.isdir(d) and not os.listdir(d):
-                os.rmdir(d)
-            if created is not None and os.path.relpath(d, target) in created:
-                created.remove(os.path.relpath(d, target))
-    plan.add("copy %s -> %s" % (os.path.relpath(src, SRC), dst), do, undo)
+        with open(src, "rb") as f:
+            atomic_write(dst, f.read())
+    plan.add("copy %s -> %s" % (os.path.relpath(src, SRC), dst), do)
 
 
-def exclude_action(plan, ex_file, target, top, paths, record):
-    """Append a marker+line pair per path to ex_file (none already there). record["exclude"] gets the
-    file, the lines, newlineBefore (the first line, if a newline had to be added after the file's last
-    line first) and fileCreated."""
+def exclude_action(plan, ex_file, target, top, paths):
+    """Append a marker+line pair per path to ex_file (none already there). Returns the record for the
+    manifest, computed now from the file as it is: the file, the lines, newlineBefore (the first
+    line, if a newline must be added after the file's last line first), fileCreated, dirCreated."""
     rels = ["/" + os.path.relpath(os.path.join(target, p.rstrip("/")), top) + ("/" if p.endswith("/") else "")
             for p in paths]
 
-    def do():
-        dir_created = not os.path.isdir(os.path.dirname(ex_file))
-        os.makedirs(os.path.dirname(ex_file), exist_ok=True)
-        existed = os.path.exists(ex_file)
-        old = open(ex_file, "rb").read() if existed else b""
+    def state():
+        old = open(ex_file, "rb").read() if os.path.exists(ex_file) else b""
         have = old.decode("utf-8", "replace").split("\n")
-        new = [r for r in rels if not any(have[i] == MARK and have[i + 1] == r for i in range(len(have) - 1))]
-        nl = bool(old) and not old.endswith(b"\n") and bool(new)
-        record["exclude"] = {"file": ex_file, "lines": rels, "newlineBefore": new[0] if nl else None,
-                             "fileCreated": not existed, "dirCreated": dir_created}
-        with steady(), open(ex_file, "a") as f:
-            if nl:
-                f.write("\n")  # else the marker would join the last pattern and break it
-            for r in new:
-                f.write("%s\n%s\n" % (MARK, r))
+        new = [r for r in rels if not any(have[i] in (MARK, kept_mark(target)) and have[i + 1] == r
+                                          for i in range(len(have) - 1))]
+        return old, new, bool(old) and not old.endswith(b"\n") and bool(new)
+    _, new, nl = state()
+    record = {"file": ex_file, "lines": rels, "newlineBefore": new[0] if nl else None,
+              "fileCreated": not os.path.exists(ex_file), "dirCreated": not os.path.isdir(os.path.dirname(ex_file))}
 
-    def undo():
-        remove_exclude(record.get("exclude"))
-    plan.add("add to local git exclude %s: %s" % (ex_file, ", ".join(rels)), do, undo)
-    return rels
+    def do():  # safe to rerun: adds only the pairs not there yet
+        os.makedirs(os.path.dirname(ex_file), exist_ok=True)
+        old, new, nl = state()
+        add = b"\n" if nl else b""  # else the marker would join the last pattern and break it
+        add += "".join("%s\n%s\n" % (MARK, r) for r in new).encode("utf-8")
+        # take back the lines an earlier uninstall here kept for files left behind
+        mine = old.decode("utf-8", "surrogateescape").split("\n")
+        for i in range(len(mine) - 1):
+            if mine[i] == kept_mark(target) and mine[i + 1] in rels:
+                mine[i] = MARK
+        taken = "\n".join(mine).encode("utf-8", "surrogateescape")
+        if add or taken != old:
+            atomic_write(ex_file, taken + add)
+    plan.add("add to local git exclude %s: %s" % (ex_file, ", ".join(rels)), do)
+    return record
 
 
-def remove_exclude(ex, only=None):
+def remove_exclude(ex, target, only=None):
     """Remove devproc's marker+line pairs (all, or only the lines in `only`). If devproc added a
     newline before a block (newlineBefore) and this call removes that whole block, which runs to the
     end of the file, the newline goes too; a file devproc created and left empty is removed.
@@ -924,13 +962,13 @@ def remove_exclude(ex, only=None):
     if not ex or not os.path.exists(ex["file"]):
         return
     drop = set(ex["lines"] if only is None else only)
-    with open(ex["file"], newline="") as f:
+    with open(ex["file"], encoding="utf-8", errors="surrogateescape", newline="") as f:
         lines = f.read().split("\n")
     keep = [True] * len(lines)
     i = 0
     while i < len(lines):
-        if lines[i].endswith(MARK) and i + 1 < len(lines) and lines[i + 1] in drop:
-            if lines[i] == MARK:
+        if (lines[i].endswith(MARK) or lines[i] == kept_mark(target)) and i + 1 < len(lines) and lines[i + 1] in drop:
+            if lines[i] in (MARK, kept_mark(target)):
                 keep[i] = False
             else:
                 lines[i] = lines[i][:-len(MARK)]  # 0.2.0: joined to the project's last pattern
@@ -946,13 +984,33 @@ def remove_exclude(ex, only=None):
             out = [l for l, k in zip(lines[:starts[-1]], keep[:starts[-1]]) if k]
     text = "\n".join(out)
     if ex.get("fileCreated") and text == "":
-        os.remove(ex["file"])
+        os.remove(os.path.realpath(ex["file"]))
         d = os.path.dirname(ex["file"])
         if ex.get("dirCreated") and os.path.isdir(d) and not os.listdir(d):
             os.rmdir(d)
         return
-    with steady(), open(ex["file"], "w", newline="") as f:
-        f.write(text)
+    atomic_write(ex["file"], text.encode("utf-8", "surrogateescape"))
+
+
+def mark_kept(ex, keep, target, shared=()):
+    """Put kept_mark(target) in place of MARK above each line in keep: lines this uninstall keeps
+    for files left behind. Another install sharing the exclude file (a worktree, or a linked file)
+    then cannot remove them with its own uninstall. A line another install also relies on (in
+    shared) keeps its MARK pair for that install, and gets a kept pair of its own appended. Safe to rerun."""
+    if not os.path.exists(ex["file"]):
+        return
+    with open(ex["file"], encoding="utf-8", errors="surrogateescape", newline="") as f:
+        lines = f.read().split("\n")
+    out = [kept_mark(target) if l == MARK and i + 1 < len(lines) and lines[i + 1] in keep
+           and lines[i + 1] not in shared else l for i, l in enumerate(lines)]
+    have = {out[i + 1] for i in range(len(out) - 1) if out[i] == kept_mark(target)}
+    add = ["%s\n%s" % (kept_mark(target), l) for l in keep if l in shared and l not in have]
+    if add:
+        if out and out[-1] == "":
+            out.pop()
+        out += add + [""]
+    if out != lines:
+        atomic_write(ex["file"], "\n".join(out).encode("utf-8", "surrogateescape"))
 
 
 def split_joined_markers_action(plan, ex):
@@ -960,21 +1018,17 @@ def split_joined_markers_action(plan, ex):
     the marker joined that pattern ("*.log# devproc: ...") and broke it. Split it off again."""
     if not ex or not os.path.exists(ex["file"]):
         return
-    with open(ex["file"], newline="") as f:
-        text = f.read()
-    lines = text.split("\n")
-    if not any(l.endswith(MARK) and l != MARK for l in lines):
+
+    def lines():
+        with open(ex["file"], encoding="utf-8", errors="surrogateescape", newline="") as f:
+            return f.read().split("\n")
+    if not any(l.endswith(MARK) and l != MARK for l in lines()):
         return
 
-    def do():
-        with steady(), open(ex["file"], "w", newline="") as f:
-            f.write("\n".join(l[:-len(MARK)] + "\n" + MARK if l.endswith(MARK) and l != MARK else l for l in lines))
-
-    def undo():
-        with steady(), open(ex["file"], "w", newline="") as f:
-            f.write(text)
-    plan.add("split the devproc marker off the project's last pattern in %s (0.2.0 joined them)" % ex["file"],
-             do, undo)
+    def do():  # reads the file again: safe to rerun
+        atomic_write(ex["file"], "\n".join(l[:-len(MARK)] + "\n" + MARK if l.endswith(MARK) and l != MARK else l
+                                           for l in lines()).encode("utf-8", "surrogateescape"))
+    plan.add("split the devproc marker off the project's last pattern in %s (0.2.0 joined them)" % ex["file"], do)
 
 
 def declared(target, name):
@@ -997,21 +1051,16 @@ def leave_old_layout_actions(plan, target, m):
             d = os.path.realpath(rec.get("projectPath", ""))
             if os.path.isdir(d):
                 plan.add("claude plugin uninstall %s --scope local   (in %s)" % (OLD_ID, d),
-                         lambda d=d: run(["claude", "plugin", "uninstall", OLD_ID, "--scope", "local", "-y"], cwd=d),
-                         lambda d=d: run(["claude", "plugin", "install", OLD_ID, "--scope", "local"], cwd=d))
+                         lambda d=d: run(["claude", "plugin", "uninstall", OLD_ID, "--scope", "local", "-y"], cwd=d))
         if declared(target, OLD_MARKETPLACE):
             plan.add("drop the shared %s marketplace from this directory (kept registered: %d other install%s)"
                      % (OLD_MARKETPLACE, len(others), "" if len(others) == 1 else "s"),
-                     lambda: drop_keys(target, name=OLD_MARKETPLACE),
-                     lambda: prev and run(["claude", "plugin", "marketplace", "add", prev, "--scope", "local"],
-                                          cwd=target))
+                     lambda: drop_keys(target, name=OLD_MARKETPLACE))
     elif prev is not None:
         plan.add("claude plugin marketplace remove %s --scope local   (no other install uses it; also removes "
                  "its plugin records)" % OLD_MARKETPLACE,
                  lambda: run(["claude", "plugin", "marketplace", "remove", OLD_MARKETPLACE, "--scope", "local"],
-                             cwd=target),
-                 lambda: prev and (run(["claude", "plugin", "marketplace", "add", prev, "--scope", "local"], cwd=target),
-                                   run(["claude", "plugin", "install", OLD_ID, "--scope", "local"], cwd=target)))
+                             cwd=target))
     plan.add("drop %s from %s if still there" % (OLD_ID, SETTINGS_LOCAL),
              lambda: drop_keys(target, name=OLD_MARKETPLACE, pid=OLD_ID))
 
@@ -1037,27 +1086,22 @@ def settings_stay_without_devproc(target, m):
         d = read_json(sl)
     except ValueError:
         return True
-    d.get("enabledPlugins", {}).pop(m.get("pluginId", OLD_ID), None)
-    d.get("extraKnownMarketplaces", {}).pop(m.get("marketplace", OLD_MARKETPLACE), None)
+    for x in (m, previous(m)):  # previous: a stopped repair or upgrade of a moved directory
+        d.get("enabledPlugins", {}).pop(x.get("pluginId", OLD_ID), None)
+        d.get("extraKnownMarketplaces", {}).pop(x.get("marketplace", OLD_MARKETPLACE), None)
+    if m.get("oldPluginInstalledByDevproc"):  # a stopped migration: the 0.2.0 entries are devproc's too
+        d.get("enabledPlugins", {}).pop(OLD_ID, None)
+        d.get("extraKnownMarketplaces", {}).pop(OLD_MARKETPLACE, None)
     return any(v not in ({}, [], None) for v in d.values())
 
 
-def register_actions(plan, target, dist, name, settings_existed):
+def register_actions(plan, target, dist, name):
     """Register this directory's snapshot as its own marketplace and install the plugin from it."""
     pid = plugin_id(name)
-
-    def undo_marketplace():  # undone last: the CLI rewrites settings.local.json
-        if registered_path(target, name) is not None:
-            remove_marketplace(target, name)
-        drop_keys(target, name=name, pid=pid)
-        if not settings_existed:
-            drop_empty_settings(target)
     plan.add("claude plugin marketplace add %s --scope local" % dist,
-             lambda: run(["claude", "plugin", "marketplace", "add", dist, "--scope", "local"], cwd=target),
-             undo_marketplace)
+             lambda: run(["claude", "plugin", "marketplace", "add", dist, "--scope", "local"], cwd=target))
     plan.add("claude plugin install %s --scope local" % pid,
-             lambda: run(["claude", "plugin", "install", pid, "--scope", "local"], cwd=target),
-             lambda: run(["claude", "plugin", "uninstall", pid, "--scope", "local", "-y"], cwd=target, check=False))
+             lambda: run(["claude", "plugin", "install", pid, "--scope", "local"], cwd=target))
 
 
 def postcheck(target, name, dist, plugin_hash, mk):
@@ -1088,44 +1132,31 @@ def postcheck(target, name, dist, plugin_hash, mk):
         "snapshot matches the source; its guard passes self-test" % (pid, VERSION))
 
 
-def manifest_files(m, target):
-    """{absolute path: {"sha256", "origin"}} from a manifest."""
-    return {os.path.join(target, k): v for k, v in m["files"].items()}
-
-
 def seed_upgrade_actions(plan, m, target, files, created):
+    """Bring the seeded files to this source's templates; files (relative path: record) is updated
+    with what the run will leave, for the manifest."""
     for src, rel in seeds():
         dst = os.path.join(target, rel)
         rec = m["files"].get(rel)
         if rec is None:
             if not os.path.exists(dst):
-                copy_action(plan, src, dst, files, "seeded", target, created)
+                copy_action(plan, src, rel, target, files, created)
             else:
                 plan.note("%s exists, not managed: untouched" % rel)
         elif rec["origin"] == "adopted":
             continue
         elif not os.path.exists(dst):
-            plan.note("%s was deleted by the project: not restored" % rel)
-        elif sha(dst) != rec["sha256"]:
+            if "was" in rec and rec["was"] is None:  # a copy a stopped run planned and had not done
+                copy_action(plan, src, rel, target, files, created)
+            else:
+                plan.note("%s was deleted by the project: not restored" % rel)
+        elif not unchanged(rec, dst):
             if sha(dst) != sha(src):
                 plan.note("%s evolved in this project: kept. Compare: diff -u %s %s" % (rel, src, dst))
         elif sha(dst) != sha(src):
-            copy_action(plan, src, dst, files, "seeded", target, created)
-
-
-def manifest_action(plan, target, build):
-    """Write the manifest from build(); undo restores the previous bytes (or removes it)."""
-    mpath = os.path.join(target, MANIFEST)
-    old = open(mpath, "rb").read() if os.path.exists(mpath) else None
-
-    def undo():
-        if old is None:
-            if os.path.exists(mpath):
-                os.remove(mpath)
+            copy_action(plan, src, rel, target, files, created)
         else:
-            with steady(), open(mpath, "wb") as f:
-                f.write(old)
-    plan.add("write manifest %s" % mpath, lambda: write_json(mpath, build()), undo)
+            files[rel] = {"sha256": sha(dst), "origin": "seeded"}
 
 
 def prune_snapshots(target, keep):
@@ -1141,75 +1172,85 @@ def prune_snapshots(target, keep):
 
 # ------------------------------------------------------------------ commands
 
+def unfinished_uninstall(target):
+    return Fail("an uninstall did not finish in %s. Finish it first: uninstall.sh --apply %s"
+                % (target, shlex.quote(target)))
+
+
 def cmd_install(target, apply):
     m = load_manifest(target)
+    if m and m.get("pending"):
+        return cmd_upgrade(target, apply)  # finishes it (or refuses a pending uninstall)
     if m:
         say("devproc %s is already installed in %s. Nothing changed. Use upgrade, repair or status."
             % (m.get("version"), target))
         return 0
     say("preflight")
     preflight(target)
+    name = marketplace_name(target)
+    left = []
     stray = sorted(k for k, v in local_settings(target).get("enabledPlugins", {}).items()
                    if v and k.split("@")[0] == "devproc")
-    if stray:
-        raise Fail("%s already enables %s but has no devproc manifest. Remove it first: "
-                   "claude plugin uninstall %s --scope local (run in %s)"
-                   % (SETTINGS_LOCAL, ", ".join(stray), stray[0], target))
-    name = marketplace_name(target)
-    left = leftovers(target)
+    left.extend(("%s enables %s" % (SETTINGS_LOCAL, k),
+                 "(cd %s && claude plugin uninstall %s --scope local)" % (shlex.quote(target), k)) for k in stray)
     if registered_path(target, name) is not None:
-        left.insert(0, ("marketplace %s registered at %s" % (name, registered_path(target, name)),
-                        "claude plugin marketplace remove %s" % name))
-    if left:
-        raise Fail("%s has devproc leftovers but no manifest (an earlier run was killed?). Remove them, "
-                   "then install again:\n%s" % (target, "\n".join("      %s: %s" % l for l in left)))
+        left.append(("marketplace %s registered at %s" % (name, registered_path(target, name)),
+                     "claude plugin marketplace remove %s" % name))
+    left.extend(leftovers(target))
+    if left:  # devproc 0.2.2 and later write the manifest first, so only an older run leaves these
+        raise Fail("%s has devproc leftovers but no manifest (a run of devproc 0.2.1 or older was killed?). "
+                   "Remove them, then install again:\n%s" % (target, "\n".join("      %s: %s" % l for l in left)))
     plan = Plan(apply)
-    files, created, ex_record = {}, [], {}
-    dirs_action(plan, target, created)  # undone last, once the settings restore has run
-    save, restore = settings_backup(target)
-    plan.add("save %s" % SETTINGS_LOCAL, save, restore)  # restores its exact bytes
+    temp_cleanup_action(plan, target)
+    mkdirs = [d for d in DIRS if not os.path.isdir(os.path.join(target, d))]
+    start = {"mkdirs": mkdirs}
+    begin_action(plan, target, start, "install")
+    files = {}
     for src, rel in seeds():
         dst = os.path.join(target, rel)
         if not os.path.exists(dst):
-            copy_action(plan, src, dst, files, "seeded")
+            copy_action(plan, src, rel, target, files)
         elif sha(dst) == sha(src):
-            files[dst] = {"sha256": sha(dst), "origin": "adopted"}
+            files[rel] = {"sha256": sha(dst), "origin": "adopted"}
             plan.note("%s already identical to the template: recorded as the project's own "
                       "(never updated or removed by devproc)" % rel)
         else:
             plan.note("%s exists and differs: left untouched, not managed by devproc" % rel)
+    ex = None
     g = git_top(target)
     if g:
         ex_file = git_exclude_file(target)
         split_joined_markers_action(plan, {"file": ex_file})  # kept by a 0.2.0 uninstall
-        mine = marked_lines(ex_file)
-        need = [p for p in EXCLUDE_PATHS if not ignored(target, p)
-                or "/" + os.path.relpath(os.path.join(target, p.rstrip("/")), g[0]) + ("/" if p.endswith("/") else "") in mine]
+        mine = marked_lines(ex_file, target)
+        theirs = kept_for_others(ex_file, target)
+        rel = lambda p: "/" + os.path.relpath(os.path.join(target, p.rstrip("/")), g[0]) + ("/" if p.endswith("/") else "")
+        need = [p for p in EXCLUDE_PATHS if not ignored(target, p) or rel(p) in mine or rel(p) in theirs]
         if need:
-            exclude_action(plan, git_exclude_file(target), target, g[0], need, ex_record)
+            ex = exclude_action(plan, ex_file, target, g[0], need)
+            # lines already there before this install (kept by an earlier uninstall, or a killed
+            # run's): their uninstall keeps the settings line while that file stays (cmd_uninstall)
+            ex["adopted"] = sorted(rel(p) for p in need if rel(p) in mine)
         else:
             plan.note("git already ignores the devproc paths; exclude file untouched")
     else:
         plan.note("not a git work tree: no exclude needed (leak scans need git and will report 'could NOT run')")
     sl = os.path.join(target, SETTINGS_LOCAL)
     settings_existed = os.path.exists(sl)
-    original = open(sl, newline="").read() if settings_existed else None
+    original = open(sl, encoding="utf-8", newline="").read() if settings_existed else None
     dist = dist_dir(target, VERSION)
     snapshot_action(plan, dist, name)
-    register_actions(plan, target, dist, name, settings_existed)
+    register_actions(plan, target, dist, name)
     phash = tree_hash(PLUGIN)
     mk = expected_marketplace(name)
-    manifest_action(plan, target, lambda: {
-        "layout": LAYOUT, "version": VERSION, "source": SRC, "pluginHash": phash, "marketplaceJson": mk,
-        "marketplace": name, "pluginId": plugin_id(name), "dist": os.path.relpath(dist, target),
-        "projectPath": target, "installedAt": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "files": {os.path.relpath(k, target): v for k, v in files.items()},
-        "createdDirs": list(created),
-        "exclude": ex_record.get("exclude"),
-        "settingsLocalExisted": settings_existed,
-        "settingsLocalOriginal": original,
-        "pluginInstalledByDevproc": True})
+    m = {"layout": LAYOUT, "version": VERSION, "source": SRC, "pluginHash": phash, "marketplaceJson": mk,
+         "marketplace": name, "pluginId": plugin_id(name), "dist": os.path.relpath(dist, target),
+         "projectPath": target, "installedAt": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+         "files": files, "createdDirs": mkdirs, "exclude": ex,
+         "settingsLocalExisted": settings_existed, "settingsLocalOriginal": original,
+         "pluginInstalledByDevproc": True}
+    start["manifest"] = m
     plan.add("post-check", lambda: postcheck(target, name, dist, phash, mk))
+    finish_action(plan, target, m)
     say("plan for %s" % target)
     plan.execute()
     if apply:
@@ -1225,7 +1266,7 @@ def file_states(m, target):
         elif not os.path.exists(p):
             state = "missing"
         else:
-            state = "as seeded" if sha(p) == rec["sha256"] else "evolved by project"
+            state = "as seeded" if unchanged(rec, p) else "evolved by project"
         say("  %-45s %s" % (rel, state))
 
 
@@ -1234,8 +1275,14 @@ def cmd_status(target):
     if not m:
         say("devproc not installed in %s" % target)
         return 1
-    say("devproc %s in %s (installed %s, source %s)" % (m["version"], target, m["installedAt"], m.get("source")))
+    say("devproc %s in %s (installed %s, source %s)" % (m["version"], target, m.get("installedAt"), m.get("source")))
     file_states(m, target)
+    if m.get("pending"):
+        q = shlex.quote(target)
+        say("  PROBLEM: a devproc run (%s) did not finish here. Fix: %s" % (
+            m["pending"], "uninstall.sh --apply %s finishes it" % q if m["pending"] == "uninstall" else
+            "install.sh --apply %s finishes it; or uninstall.sh --apply %s removes it" % (q, q)))
+        return 4
     if m.get("layout", 1) < LAYOUT:
         on = enabled(target, OLD_ID)
         say("  plugin %s: %s" % (OLD_ID, "enabled" if on else "NOT enabled"))
@@ -1269,8 +1316,10 @@ def cmd_status(target):
 
 def converge_actions(plan, target, m, phash):
     """Bring a layout-2 install to this source's version (the same one, for repair) and fix every
-    problem health() finds. Returns (marketplace name, snapshot dir, the manifest to write, and a
-    function that adds the tidying steps; the caller adds it after the manifest and the post-check)."""
+    problem health() finds. For a pending run, m is the install as it was before that run (its
+    "previous"), with the run's records: the steps it had not done are planned again, the ones it
+    had done find nothing to do. Returns (marketplace name, snapshot dir, the manifest the run
+    leaves, and a function that adds the tidying steps; the caller adds it after the final manifest)."""
     dist = dist_dir(target, VERSION)
     old_name, old_pid = m["marketplace"], m["pluginId"]
     old_dist = os.path.join(target, m["dist"])
@@ -1281,13 +1330,10 @@ def converge_actions(plan, target, m, phash):
     new_version = m["version"] != VERSION
     reg = registered_path(target, name)
     old_reg = registered_path(target, old_name) if relocated else reg
-    later = []  # tidying steps, added after the post-check
-    save, restore = settings_backup(target)
-    plan.add("save %s" % SETTINGS_LOCAL, save, restore)  # undone last: restores its exact bytes
     if relocated:
         plan.note("this directory was moved or copied from %s: it gets a marketplace of its own, %s. Marketplace "
                   "%s stays the original's%s" % (m["projectPath"], name, old_name,
-                                                 "; the original's folder is gone, so it is removed at the end"
+                                                 "; the original's folder is gone, so it is removed"
                                                  if original_gone and old_reg is not None
                                                  and not os.path.isdir(old_reg) else ""))
         if reg is not None and not same_path(reg, dist):
@@ -1295,14 +1341,15 @@ def converge_actions(plan, target, m, phash):
         for d in local_records(target, old_pid):
             desc = "claude plugin uninstall %s --scope local   (this directory's record of the old plugin id, in %s)" % (
                 old_pid, d)
-            do = (lambda d=d: run(["claude", "plugin", "uninstall", old_pid, "--scope", "local", "-y"], cwd=d))
-            if old_reg is not None and os.path.isdir(old_reg):
-                plan.add(desc, do, lambda d=d: run(["claude", "plugin", "install", old_pid, "--scope", "local"], cwd=d))
-            else:
-                # its marketplace folder is gone, so it could not be reinstalled on a rollback: tidy it at the end
-                later.append((desc, do))
+            plan.add(desc, lambda d=d: run(["claude", "plugin", "uninstall", old_pid, "--scope", "local", "-y"], cwd=d))
         plan.add("drop %s and %s from %s" % (old_name, old_pid, SETTINGS_LOCAL),
                  lambda: drop_keys(target, name=old_name, pid=old_pid))
+        if original_gone and old_reg is not None and not os.path.isdir(old_reg):
+            # no --scope: the name is declared only in the gone folder's settings.local.json, so a
+            # local-scope remove from here is refused ("not declared in local settings")
+            plan.add("claude plugin marketplace remove %s   (the original's; its folder %s no longer exists)"
+                     % (old_name, m["projectPath"]),
+                     lambda: run(["claude", "plugin", "marketplace", "remove", old_name], cwd=target))
     aside = None
     mk = expected_marketplace(name)
     if not new_version and not relocated and snapshot_ok(dist, phash, installed_marketplace(m)):
@@ -1313,44 +1360,22 @@ def converge_actions(plan, target, m, phash):
     else:
         if os.path.lexists(dist):
             aside = "%s.broken-%s" % (dist, time.strftime("%Y%m%d-%H%M%S"))
-
-            def move_aside():  # same parent folder: renaming needs no write bit on dist itself
-                os.rename(dist, aside)
-
-            def move_back():
-                if os.path.lexists(aside):
-                    remove_tree(dist)
-                    os.rename(aside, dist)
-            plan.add("move the snapshot that does not match aside: %s" % aside, move_aside, move_back)
+            # same parent folder: renaming needs no write bit on dist itself
+            plan.add("move the snapshot that does not match aside: %s" % aside, lambda: os.rename(dist, aside))
         snapshot_action(plan, dist, name)
     if not same_path(reg, dist):
-        def undo_add(reg=reg):
-            if reg is None:
-                if registered_path(target, name) is not None:
-                    remove_marketplace(target, name)
-            elif os.path.isdir(reg):
-                run(["claude", "plugin", "marketplace", "add", reg, "--scope", "local"], cwd=target)
-                run(["claude", "plugin", "marketplace", "update", name], cwd=target)
-                if list_entry(target, pid) is not None:
-                    run(["claude", "plugin", "update", pid, "--scope", "local"], cwd=target)
-            else:
-                raise Fail("marketplace %s was registered at %s, which no longer exists, so it cannot be "
-                           "pointed back; it now points at %s" % (name, reg, dist))
         plan.add("claude plugin marketplace add %s --scope local   (%s %s)" % (
             dist, "repoints" if reg is not None else "registers", name),
-            lambda: run(["claude", "plugin", "marketplace", "add", dist, "--scope", "local"], cwd=target),
-            undo_add)
+            lambda: run(["claude", "plugin", "marketplace", "add", dist, "--scope", "local"], cwd=target))
     rec = None if relocated else list_entry(target, pid)
     install = (lambda: run(["claude", "plugin", "install", pid, "--scope", "local"], cwd=target))
     uninstall = (lambda: run(["claude", "plugin", "uninstall", pid, "--scope", "local", "-y"], cwd=target, check=False))
     if rec is None:
-        plan.add("claude plugin install %s --scope local" % pid, install, uninstall)
+        plan.add("claude plugin install %s --scope local" % pid, install)
     elif rec.get("errors"):
-        plan.add("claude plugin uninstall %s --scope local   (Claude Code reports load errors for it)" % pid,
-                 uninstall, install)
-        plan.add("claude plugin install %s --scope local" % pid, install, uninstall)
+        plan.add("claude plugin uninstall %s --scope local   (Claude Code reports load errors for it)" % pid, uninstall)
+        plan.add("claude plugin install %s --scope local" % pid, install)
     elif rec.get("version") != VERSION:
-        # undone by the marketplace step's undo, which points back and updates again
         plan.add("claude plugin marketplace update %s" % name,
                  lambda: run(["claude", "plugin", "marketplace", "update", name], cwd=target))
         plan.add("claude plugin update %s --scope local" % pid,
@@ -1362,102 +1387,103 @@ def converge_actions(plan, target, m, phash):
     if g:
         need = [p for p in required_ignores(m) if not ignored(target, p) and not tracked(target, p)]
         if need:
-            rec_ex = {}
-            added = exclude_action(plan, git_exclude_file(target), target, g[0], need, rec_ex)
-            ex = {"file": git_exclude_file(target), "lines": sorted(set(ex.get("lines", [])) | set(added)),
-                  "newlineBefore": ex.get("newlineBefore"), "fileCreated": bool(ex.get("fileCreated")),
-                  "dirCreated": bool(ex.get("dirCreated"))}
-
-            def merge_newline():  # the append above may have had to add a newline first, or the file
-                new = rec_ex.get("exclude", {})
-                ex["newlineBefore"] = new.get("newlineBefore") or ex["newlineBefore"]
-                ex["fileCreated"] = ex["fileCreated"] or bool(new.get("fileCreated"))
-                ex["dirCreated"] = ex["dirCreated"] or bool(new.get("dirCreated"))
-            plan.add("record the git exclude lines", merge_newline)
+            new = exclude_action(plan, git_exclude_file(target), target, g[0], need)
+            ex = {"file": new["file"], "lines": sorted(set(ex.get("lines", [])) | set(new["lines"])),
+                  "newlineBefore": new["newlineBefore"] or ex.get("newlineBefore"),
+                  "fileCreated": bool(ex.get("fileCreated")) or new["fileCreated"],
+                  "dirCreated": bool(ex.get("dirCreated")) or new["dirCreated"], "adopted": ex.get("adopted", [])}
     keep = [dist]
     if new_version and not relocated and snapshot_ok(old_dist, m["pluginHash"], installed_marketplace(m)):
         keep.append(old_dist)  # sessions still running loaded it
     m_new = dict(m, version=VERSION, pluginHash=phash, marketplaceJson=mk, marketplace=name, pluginId=pid,
                  dist=os.path.relpath(dist, target), projectPath=target, exclude=ex or None)
 
+    def moved_aside():  # this run's, and any a stopped earlier run left
+        base = os.path.dirname(dist)
+        return [os.path.join(base, n) for n in sorted(os.listdir(base)) if n.startswith(os.path.basename(dist) + ".broken-")
+                ] if os.path.isdir(base) and not os.path.islink(base) else []
+
     def tidy():
-        if aside:
-            plan.add("remove the snapshot moved aside", lambda: remove_tree(aside), warn=True)
+        if aside or moved_aside():
+            plan.add("remove the snapshot moved aside", lambda: [remove_tree(p) for p in moved_aside()], warn=True)
         if new_version:  # same version: nothing to prune, a kept previous snapshot stays
             plan.add("remove snapshots other than %s" % " and ".join(os.path.relpath(k, target) for k in keep),
                      lambda: prune_snapshots(target, keep), warn=True)
-        for desc, do in later:
-            plan.add(desc, do, warn=True)
-        if original_gone and old_reg is not None and not os.path.isdir(old_reg):
-            # no --scope: the name is declared only in the gone folder's settings.local.json, so a
-            # local-scope remove from here is refused ("not declared in local settings")
-            plan.add("claude plugin marketplace remove %s   (the original's; its folder %s no longer exists)"
-                     % (old_name, m["projectPath"]),
-                     lambda: run(["claude", "plugin", "marketplace", "remove", old_name], cwd=target),
-                     warn=True)
     return name, dist, m_new, tidy
+
+
+def previous(m):
+    """The install as it was before the pending run that wrote m (m itself if none is pending)."""
+    return dict(m, **m["previous"]) if m.get("pending") and isinstance(m.get("previous"), dict) else m
 
 
 def cmd_upgrade(target, apply):
     m = load_manifest(target)
     if not m:
         raise Fail("devproc not installed in %s; run install first" % target)
-    layout = m.get("layout", 1)
+    if m.get("pending") == "uninstall":
+        raise unfinished_uninstall(target)
+    if m.get("pending"):
+        say("an earlier devproc run (%s) did not finish in %s: finishing it" % (m["pending"], target))
+    base = previous(m)
+    layout = base.get("layout", 1)
     phash = tree_hash(PLUGIN)
-    if layout >= LAYOUT and m["version"] == VERSION and phash != m["pluginHash"]:
+    if layout >= LAYOUT and base["version"] == VERSION and phash != base["pluginHash"]:
         raise Fail("this source's plugin changed since %s was installed here, but the version is still "
                    "%s. A version's code never changes: raise \"version\" in %s, then run --upgrade."
                    % (VERSION, VERSION, os.path.join(PLUGIN, ".claude-plugin", "plugin.json")))
     say("preflight")
     preflight(target)
     plan = Plan(apply)
-    files = manifest_files(m, target)
-    created = list(m.get("createdDirs", []))
-    seed_upgrade_actions(plan, m, target, files, created)
+    temp_cleanup_action(plan, target)
+    start = {}
+    files = {k: dict(v) for k, v in base["files"].items()}
+    created = list(base.get("createdDirs", []))
+    tidy = None
     if layout >= LAYOUT:
-        for p, fix in health(target, m):
+        if m.get("pending") and m["marketplace"] not in (base["marketplace"], marketplace_name(target)):
+            # a stopped repair of a directory moved or copied again since: the name it gave the place it
+            # was then. Removed while the old pending manifest still names it, so a kill here repeats it.
+            unregister_actions(plan, target, m["marketplace"], m["pluginId"], m["projectPath"])
+        begin_action(plan, target, start, m.get("pending") or "upgrade to %s" % VERSION)
+        split_joined_markers_action(plan, current_exclude(target, base))  # a stopped 0.2.0 migration's
+        seed_upgrade_actions(plan, base, target, files, created)
+        for p, fix in health(target, base):
             if fix.startswith("--"):
                 plan.note("problem, fixed by this run: " + p)
-        name, new, m_new, tidy = converge_actions(plan, target, m, phash)
-        if m["version"] == VERSION:
+        if m.get("pending") == "migrate":  # finish leaving the 0.2.0 layout: its steps find nothing once done
+            leave_old_layout_actions(plan, target, dict(base, pluginInstalledByDevproc=base.get(
+                "oldPluginInstalledByDevproc", True)))
+        name, new, m_new, tidy = converge_actions(plan, target, base, phash)
+        if base["version"] == VERSION and not m.get("pending"):
             plan.note("plugin already at %s with the same code" % VERSION)
     else:
         # layout 1 -> 2: leave the shared marketplace, give this directory its own snapshot
         name = marketplace_name(target)
         new = dist_dir(target, VERSION)
-        tidy = None
         if registered_path(target, name) is not None:
             raise Fail("a marketplace named %s is already registered (%s); remove it, then rerun"
                        % (name, registered_path(target, name)))
         if os.path.lexists(new):
             raise Fail("%s already exists; remove it, then rerun" % new)
-        save, restore = settings_backup(target)
-        plan.add("save %s" % SETTINGS_LOCAL, save, restore)
         if not os.path.isdir(os.path.join(target, DIST)):
-            def mk():
-                os.mkdir(os.path.join(target, DIST))
-                created.append(DIST)
-
-            def unmk():
-                p = os.path.join(target, DIST)
-                if os.path.isdir(p) and not os.listdir(p):
-                    os.rmdir(p)
-                if DIST in created:
-                    created.remove(DIST)
-            plan.add("create %s" % DIST, mk, unmk)
+            start["mkdirs"] = [DIST]
+            created.append(DIST)
+        begin_action(plan, target, start, "migrate")
+        seed_upgrade_actions(plan, m, target, files, created)
         snapshot_action(plan, new, name)
         split_joined_markers_action(plan, current_exclude(target, m))
         leave_old_layout_actions(plan, target, m)
-        register_actions(plan, target, new, name, True)
+        register_actions(plan, target, new, name)
         m_new = dict(m, layout=LAYOUT, version=VERSION, pluginHash=phash, marketplace=name,
                      pluginId=plugin_id(name), dist=os.path.relpath(new, target), projectPath=target,
-                     pluginInstalledByDevproc=True, marketplaceJson=expected_marketplace(name))
-
-    def build():
-        return dict(m_new, upgradedAt=time.strftime("%Y-%m-%dT%H:%M:%S%z"), createdDirs=list(created),
-                    files={os.path.relpath(k, target): v for k, v in files.items()})
-    manifest_action(plan, target, build)
+                     pluginInstalledByDevproc=True, marketplaceJson=expected_marketplace(name),
+                     oldPluginInstalledByDevproc=m.get("pluginInstalledByDevproc", True))
+    m_full = dict(m_new, upgradedAt=time.strftime("%Y-%m-%dT%H:%M:%S%z"), createdDirs=created, files=files)
+    start["manifest"] = (dict(m_full, previous={k: base[k] for k in PREVIOUS_KEYS if k in base})
+                         if layout >= LAYOUT else m_full)
     plan.add("post-check", lambda: postcheck(target, name, new, phash, m_new["marketplaceJson"]))
+    finish_action(plan, target, m_full)
     if tidy:
         tidy()
     say("plan for %s" % target)
@@ -1469,6 +1495,9 @@ def cmd_repair(target, apply):
     m = load_manifest(target)
     if not m:
         raise Fail("devproc not installed in %s; run install first" % target)
+    if m.get("pending"):
+        refuse_symlinks(target)  # finishing a pending upgrade copies seeded files: none may lead elsewhere
+        return cmd_upgrade(target, apply)  # finishes it (or refuses a pending uninstall)
     if m.get("layout", 1) < LAYOUT:
         raise Fail("installed with the 0.2.0 layout: run --upgrade, which moves it to its own snapshot")
     if m["version"] != VERSION:
@@ -1488,58 +1517,134 @@ def cmd_repair(target, apply):
     say("preflight")
     preflight(target)
     plan = Plan(apply)
+    temp_cleanup_action(plan, target)
+    start = {}
+    begin_action(plan, target, start, "repair")
     for p, _ in probs:
         plan.note("problem: " + p)
     name, dist, m_new, tidy = converge_actions(plan, target, m, phash)
-    manifest_action(plan, target, lambda: dict(m_new, repairedAt=time.strftime("%Y-%m-%dT%H:%M:%S%z")))
+    m_full = dict(m_new, repairedAt=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+    start["manifest"] = dict(m_full, previous={k: m[k] for k in PREVIOUS_KEYS if k in m})
     plan.add("post-check", lambda: postcheck(target, name, dist, phash, m_new["marketplaceJson"]))
+    finish_action(plan, target, m_full)
     tidy()
     say("plan for %s" % target)
     plan.execute()
     return 0
 
 
+def unregister_actions(plan, target, name, pid, project_path):
+    """Take marketplace `name` and plugin `pid` off this directory: the marketplace itself if it is
+    this directory's (registered inside it, or a dead path left by this directory or by a gone
+    original), else only this directory's own records of the plugin."""
+    reg = registered_path(target, name)
+    ours = reg is not None and (inside(reg, os.path.join(target, DIST)) or (
+        not os.path.isdir(reg) and (target == project_path or not os.path.exists(project_path))))
+    if reg is not None and ours:
+        plan.add("claude plugin marketplace remove %s --scope local   (also removes its plugin records)" % name,
+                 lambda: remove_marketplace(target, name))
+    elif reg is not None:
+        plan.note("marketplace %s points at %s, not into this directory: left registered" % (name, reg))
+        for d in local_records(target, pid):
+            plan.add("claude plugin uninstall %s --scope local   (this copy's record, in %s)" % (pid, d),
+                     lambda d=d: run(["claude", "plugin", "uninstall", pid, "--scope", "local", "-y"], cwd=d),
+                     warn=True)
+    plan.add("drop %s and %s from %s if still there" % (name, pid, SETTINGS_LOCAL),
+             lambda: drop_keys(target, name=name, pid=pid))
+
+
+def shared_exclude_lines(target, m, ex):
+    """Lines of exclude file ex["file"] that another devproc install relies on too: the original's,
+    for a copy in the same repository; another worktree's of the same repository, either way round
+    (git shares info/exclude between worktrees, each matching it against its own top); or any
+    devproc install Claude Code has a record of whose exclude file is the same file (repositories
+    whose .git/info/exclude links to one shared file). A folder whose manifest is this directory's
+    own, reached through a symlinked .claude, is not another install."""
+    out = set()
+    others = {m.get("projectPath")}
+    if git_top(target):
+        wl = run(["git", "-C", target, "worktree", "list", "--porcelain"], check=False).stdout.split("\n")
+        others |= {os.path.realpath(l[len("worktree "):]) for l in wl if l.startswith("worktree ")}
+    others |= {os.path.realpath(p.get("projectPath", "")) for p in plugin_list(target)
+               if str(p.get("id", "")).startswith("devproc@") and p.get("projectPath")}
+    for d in others - {target, None}:
+        if not os.path.exists(os.path.join(d, MANIFEST)) or same_path(os.path.join(d, MANIFEST), os.path.join(target, MANIFEST)):
+            continue
+        try:
+            o = load_manifest(d)
+            oex = current_exclude(d, o)
+        except Fail:
+            continue
+        if oex and same_path(oex["file"], ex["file"]):
+            out.update(oex["lines"])
+    return out
+
+
+def empty_own_dirs(target):
+    """devproc's own folders that are empty but for each other and temp files: a run killed in its
+    first step, or an uninstall killed between removing the manifest and removing them, leaves them
+    with no manifest naming them."""
+    out = []
+    for d in (DIST, ".claude/devproc", ".claude/rules/devproc"):
+        p = os.path.join(target, d)
+        if os.path.isdir(p) and not os.path.islink(p) and all(os.path.join(d, n) in out or is_temp(n) for n in os.listdir(p)):
+            out.append(d)
+    return out
+
+
+def leave_old_layout_uninstall_actions(plan, target, by_us):
+    """Layout 1 (devproc 0.2.0): take this directory off devproc@devproc and the shared marketplace."""
+    if by_us:
+        mine, others = old_records(target)
+        if others:
+            for rec in mine:
+                d = os.path.realpath(rec.get("projectPath", ""))
+                if os.path.isdir(d):
+                    plan.add("claude plugin uninstall %s --scope local   (in %s)" % (OLD_ID, d),
+                             lambda d=d: run(["claude", "plugin", "uninstall", OLD_ID, "--scope", "local", "-y"],
+                                             cwd=d))
+            plan.add("drop the shared %s marketplace from this directory (kept registered: %d other install%s)"
+                     % (OLD_MARKETPLACE, len(others), "" if len(others) == 1 else "s"),
+                     lambda: drop_keys(target, name=OLD_MARKETPLACE, pid=OLD_ID))
+        elif registered_path(target, OLD_MARKETPLACE) is not None:
+            plan.add("claude plugin marketplace remove %s --scope local   (no other install uses it)" % OLD_MARKETPLACE,
+                     lambda: run(["claude", "plugin", "marketplace", "remove", OLD_MARKETPLACE, "--scope", "local"],
+                                 cwd=target))
+        plan.add("drop %s from %s if still there" % (OLD_ID, SETTINGS_LOCAL),
+                 lambda: drop_keys(target, name=OLD_MARKETPLACE, pid=OLD_ID))
+
+
 def cmd_uninstall(target, apply):
     m = load_manifest(target)
     if not m:
-        say("devproc not installed in %s. Nothing changed." % target)
+        refuse_symlinks(target, with_seeds=False)  # leftovers reached through a symlink are another directory's
+        left = empty_own_dirs(target)
+        if not left and not stale_temp_files(target):
+            say("devproc not installed in %s. Nothing changed." % target)
+            return 0
+        plan = Plan(apply, uninstall=True)
+        temp_cleanup_action(plan, target)
+        if left:
+            plan.add("remove the empty devproc folders a killed run left: %s" % ", ".join(left),
+                     lambda: [os.rmdir(os.path.join(target, d)) for d in empty_own_dirs(target)])
+        say("plan for %s" % target)
+        plan.execute()
         return 0
-    plan = Plan(apply, rollback=False)
+    plan = Plan(apply, uninstall=True)
+    temp_cleanup_action(plan, target)
+    mpath = os.path.join(target, MANIFEST)
+    plan.add("mark the manifest pending (uninstall) first",
+             lambda: write_json(mpath, dict(m, pending="uninstall")))
     if m.get("layout", 1) < LAYOUT:
-        if m.get("pluginInstalledByDevproc", True):
-            mine, others = old_records(target)
-            if others:
-                for rec in mine:
-                    d = os.path.realpath(rec.get("projectPath", ""))
-                    if os.path.isdir(d):
-                        plan.add("claude plugin uninstall %s --scope local   (in %s)" % (OLD_ID, d),
-                                 lambda d=d: run(["claude", "plugin", "uninstall", OLD_ID, "--scope", "local", "-y"],
-                                                 cwd=d))
-                plan.add("drop the shared %s marketplace from this directory (kept registered: %d other install%s)"
-                         % (OLD_MARKETPLACE, len(others), "" if len(others) == 1 else "s"),
-                         lambda: drop_keys(target, name=OLD_MARKETPLACE, pid=OLD_ID))
-            elif registered_path(target, OLD_MARKETPLACE) is not None:
-                plan.add("claude plugin marketplace remove %s --scope local   (no other install uses it)" % OLD_MARKETPLACE,
-                         lambda: run(["claude", "plugin", "marketplace", "remove", OLD_MARKETPLACE, "--scope", "local"],
-                                     cwd=target))
-            plan.add("drop %s from %s if still there" % (OLD_ID, SETTINGS_LOCAL),
-                     lambda: drop_keys(target, name=OLD_MARKETPLACE, pid=OLD_ID))
+        leave_old_layout_uninstall_actions(plan, target, m.get("pluginInstalledByDevproc", True))
     else:
-        name, pid = m["marketplace"], m["pluginId"]
-        reg = registered_path(target, name)
-        ours = reg is not None and (inside(reg, os.path.join(target, DIST)) or (
-            not os.path.isdir(reg) and (target == m["projectPath"] or not os.path.exists(m["projectPath"]))))
-        if reg is not None and ours:
-            plan.add("claude plugin marketplace remove %s --scope local   (also removes its plugin records)" % name,
-                     lambda: remove_marketplace(target, name))
-        elif reg is not None:
-            plan.note("marketplace %s points at %s, not into this directory: left registered" % (name, reg))
-            for d in local_records(target, pid):
-                plan.add("claude plugin uninstall %s --scope local   (this copy's record, in %s)" % (pid, d),
-                         lambda d=d: run(["claude", "plugin", "uninstall", pid, "--scope", "local", "-y"], cwd=d),
-                         warn=True)
-        plan.add("drop %s and %s from %s if still there" % (name, pid, SETTINGS_LOCAL),
-                 lambda: drop_keys(target, name=name, pid=pid))
+        if "oldPluginInstalledByDevproc" in m:  # a stopped migration from 0.2.0: it may not have left the old layout
+            leave_old_layout_uninstall_actions(plan, target, m["oldPluginInstalledByDevproc"])
+        unregister_actions(plan, target, m["marketplace"], m["pluginId"], m["projectPath"])
+        before = previous(m)
+        if before is not m and before["marketplace"] != m["marketplace"]:
+            # a stopped repair of a moved or copied directory: what it held before, the original's name
+            unregister_actions(plan, target, before["marketplace"], before["pluginId"], before["projectPath"])
         plan.add("remove the plugin snapshots in %s" % DIST,
                  lambda: prune_snapshots(target, keep=[]))
     kept = []
@@ -1547,7 +1652,7 @@ def cmd_uninstall(target, apply):
         p = os.path.join(target, rel)
         if not os.path.exists(p):
             continue
-        if rec["origin"] == "seeded" and sha(p) == rec["sha256"]:
+        if rec["origin"] == "seeded" and unchanged(rec, p):
             plan.add("remove %s (unchanged since install)" % rel, lambda p=p: os.remove(p))
         else:
             kept.append(rel)
@@ -1558,7 +1663,7 @@ def cmd_uninstall(target, apply):
                 continue
             for f in fs:
                 rel = os.path.relpath(os.path.join(root, f), target)
-                if rel not in m["files"] and rel != MANIFEST:
+                if rel not in m["files"] and rel != MANIFEST and not is_temp(f):
                     kept.append(rel)
     # a settings file the project had before install goes back to how it was, exclude line included;
     # one devproc created stays ignored while it still holds the project's own entries
@@ -1573,31 +1678,45 @@ def cmd_uninstall(target, apply):
             rel = line.lstrip("/")
             rel_t = os.path.relpath(os.path.join(top, rel.rstrip("/")), target)
             if rel_t == SETTINGS_LOCAL.rstrip("/"):
-                if settings_will_stay:
+                # the line was there before install (an earlier uninstall kept it for this file):
+                # it stays with the file, which goes back to how it was
+                if settings_will_stay or (m.get("settingsLocalExisted") and line in ex.get("adopted", [])):
                     keep_lines.append(line)
             elif any(k == rel_t or k.startswith(rel_t + "/") for k in kept):
                 keep_lines.append(line)
-        drop = [l for l in ex["lines"] if l not in keep_lines]
+        theirs = shared_exclude_lines(target, m, ex)
+        shared = [l for l in ex["lines"] if l in theirs and l not in keep_lines]
+        shared_kept = [l for l in keep_lines if l in theirs]
+        drop = [l for l in ex["lines"] if l not in keep_lines and l not in shared]
         if drop:
             plan.add("remove devproc lines from %s: %s" % (ex["file"], ", ".join(drop)),
-                     lambda: remove_exclude(ex, only=drop))
+                     lambda: remove_exclude(ex, target, only=drop))
         if keep_lines:
+            plan.add("mark the lines kept for files left behind in %s: %s" % (ex["file"], ", ".join(keep_lines)),
+                     lambda: mark_kept(ex, keep_lines, target, shared_kept))
             plan.note("git exclude lines kept because files stay behind: %s (in %s). Remove the files, "
-                      "then delete those lines and the '%s' line above each." % (", ".join(keep_lines), ex["file"], MARK))
+                      "then delete those lines and the '%s' line above each."
+                      % (", ".join(keep_lines), ex["file"], kept_mark(target)))
+        if shared:
+            plan.note("git exclude lines kept because another devproc install uses the same exclude file "
+                      "(%s): %s" % (ex["file"], ", ".join(shared)))
     if m.get("settingsLocalExisted"):
         plan.add("restore %s to its bytes from before install, if the project did not change it" % SETTINGS_LOCAL,
                  lambda: restore_original_settings(target, m))
     else:
         plan.add("remove %s if devproc created it and it is now empty" % SETTINGS_LOCAL,
                  lambda: drop_empty_settings(target))
-    plan.add("remove manifest", lambda: os.remove(os.path.join(target, MANIFEST)))
-
-    def prune_dirs():
-        for d in reversed(m.get("createdDirs", [])):
+    def remove_manifest():
+        # with the folders in one step: a run killed between the two would leave empty folders
+        # that no later run knows are devproc's
+        os.remove(os.path.join(target, MANIFEST))
+        failpoint("uninstall:manifest-removed")
+        # devproc's own folders go when empty even if unrecorded (a killed earlier run created them)
+        for d in [DIST, ".claude/devproc", ".claude/rules/devproc"] + list(reversed(m.get("createdDirs", []))):
             p = os.path.join(target, d)
             if os.path.isdir(p) and not os.path.islink(p) and not os.listdir(p):
                 os.rmdir(p)
-    plan.add("remove empty directories devproc created", prune_dirs)
+    plan.add("remove the manifest and the empty directories devproc created", remove_manifest)
     if kept:
         shown = kept[:MAX_LISTED]
         plan.note("kept (changed by the project, or project data): %d file(s)\n      %s%s"
@@ -1610,8 +1729,8 @@ def cmd_uninstall(target, apply):
 
 USAGE = """usage: devproc_install.py install|upgrade|repair|uninstall|status [--apply] TARGET_DIR
   dry run unless --apply is given (status never writes).
-  exit codes: 0 done (status: healthy), 1 refused or rolled back (status: not installed),
-  2 usage, 3 rollback incomplete, uninstall stopped, or unexpected error, 4 status: problems."""
+  exit codes: 0 done (status: healthy), 1 refused, nothing changed (status: not installed),
+  2 usage, 3 stopped part-way (rerun the same command to finish), 4 status: problems."""
 
 
 def lock(target):
@@ -1622,9 +1741,43 @@ def lock(target):
     except OSError as e:
         os.close(fd)
         if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
-            raise Fail("another devproc run is working on %s; wait for it to finish" % target)
+            raise Fail("another devproc run is working on %s (or a claude call it left running); wait for it "
+                       "to finish" % target)
         raise Fail("could not lock %s: %s" % (target, e))
+    LOCKS.append(fd)
     return fd
+
+
+def lock_config(wait=300):
+    """Queue behind other devproc runs before changing Claude Code's user-level plugin registry, which
+    every directory shares: an exclusive flock on the config folder itself (no lock file), waiting
+    up to `wait` s. The target lock alone would let runs in two directories change it at once."""
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    if not os.path.isdir(cfg):
+        return None
+    fd = os.open(cfg, os.O_RDONLY)
+    deadline, told = time.monotonic() + wait, False
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            LOCKS.append(fd)
+            return fd
+        except OSError as e:
+            if e.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
+                os.close(fd)
+                raise Fail("could not lock %s: %s" % (cfg, e))
+        if INTERRUPTS["n"]:
+            os.close(fd)
+            raise Fail("interrupted while waiting for Claude Code's plugin registry; nothing was changed", 3)
+        if not told:
+            say("waiting for another devproc run to finish with Claude Code's plugin registry (%s), up to %d s"
+                % (cfg, wait))
+            told = True
+        if time.monotonic() > deadline:
+            os.close(fd)
+            raise Fail("another devproc run kept Claude Code's plugin registry (%s) busy for %d s; "
+                       "rerun when it has finished" % (cfg, wait))
+        time.sleep(0.2)
 
 
 def main(argv):
@@ -1654,6 +1807,7 @@ def main(argv):
             refuse_symlinks(target, with_seeds=False, code=4 if args[0] == "status" else 1)
         if apply and args[0] != "status":
             lock(target)
+            lock_config()
         if args[0] == "install":
             return cmd_install(target, apply)
         if args[0] == "upgrade":
@@ -1668,10 +1822,11 @@ def main(argv):
         return e.code
     except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError) as e:
         say("devproc: unexpected error (%s: %s). Nothing after the last printed step was done; "
-            "run --status to see the state." % (type(e).__name__, e))
+            "rerun the same command to finish, or run --status to see the state." % (type(e).__name__, e))
         return 3
     except KeyboardInterrupt:
-        say("devproc: interrupted. Nothing after the last printed step was done; run --status to see the state.")
+        say("devproc: stopped at once (interrupted twice). The manifest says what the run was doing: rerun "
+            "the same command to finish it, or uninstall.sh --apply to remove it; --status shows the state.")
         return 3
 
 
