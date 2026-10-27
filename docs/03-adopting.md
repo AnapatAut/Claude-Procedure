@@ -59,7 +59,9 @@ Requirements: `python3` 3.8 or later, `git`, and the Claude Code CLI. Tested on 
   - It keeps the git exclude lines for kept files, so evidence is not committed by accident. The marker above each kept line names this directory, so another install that shares the exclude file (a worktree, or a linked file) never removes it.
   - It removes this directory's own marketplace and snapshots. Other directories are not touched, also when this directory is a copy of another. Uninstalling an original does remove the marketplace that its never-repaired copies borrow: repair those copies first.
 
-## Test evidence (2026-10-26, version 0.2.2)
+## Test evidence (2026-10-27, version 0.2.3)
+
+0.2.3 changes only a rule's text; the installer mutants and reviews ran on 0.2.2, whose installer code 0.2.3 keeps.
 
 | Test | Result |
 |---|---|
@@ -69,6 +71,7 @@ Requirements: `python3` 3.8 or later, `git`, and the Claude Code CLI. Tested on 
 | Installer end-to-end, `tests/installer-e2e.sh`: sandbox config, throwaway dirs, real sessions' debug logs | 440/440 checks pass (details below) |
 | Kill sweep, `tests/installer-killsweep.sh`: install, upgrade and uninstall each killed (SIGKILL) before every step | 190/190 checks pass: the project's data intact, a rerun finishes, uninstall leaves the directory byte-identical |
 | Same e2e test against 106 installer mutants, each with one safeguard switched off (`tests/installer-mutants.py`) | 106/106 caught, each by its own expected check |
+| Live logged-in sessions (0.2.3), browser rule: a screenshot task with the chrome-devtools MCP, and one with a headless Chrome script; the prompts said nothing about closing | both browsers were ended before the session ended; the script used its own profile, a `trap` and a `pgrep` check; real config unchanged after uninstall |
 | Live logged-in session (0.2.1) in a throwaway directory, push of a commit with a fake AWS key | the hook ran from the directory's snapshot (`…/.claude/devproc/dist/0.2.1/plugin/scripts/guard.py`) and denied the push; nothing pushed; after uninstall the real `settings.json`, `installed_plugins.json` and `known_marketplaces.json` are byte-identical |
 | Live interactive session (guard 0.1.0), plugin loaded, `/usr/bin/git push` (a spelling simple permission rules miss) | Claude Code stopped with "Hook PreToolUse:Bash requires confirmation … devproc (P17)"; declined; nothing pushed |
 | Live `claude -p` session (guard 0.2.0), `bash -c 'git push origin HEAD:main'` with a fake AWS key in the commit | denied: "leak scan found 1 hit(s) (1 commit(s) not on remote origin scanned): … cfg.py:1 [aws-access-key-id]", key not printed; nothing pushed |

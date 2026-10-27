@@ -1,4 +1,4 @@
-# devproc: the general procedure as Claude Code config (design, 2026-10-26, version 0.2.2)
+# devproc: the general procedure as Claude Code config (design, 2026-10-27, version 0.2.3)
 
 Usage: `README.md`. The procedure it packages: `docs/PROCEDURE.md`.
 
@@ -136,13 +136,20 @@ Nothing is written to `~/.claude/settings.json` or `~/.claude/rules/`. Outside t
 - A project that already has its own procedure keeps it: rule `00-precedence.md` says the project's own procedure wins over this base.
 - Inside git, only the top level of the main checkout can be a target; a linked worktree points to its main checkout.
 
+## 6. Test evidence (2026-10-27, versions 0.2.2 and 0.2.3)
 
+0.2.3 changes only the browser bullet of `30-work.md`: an MCP browser's process is ended too, not only its pages. On 0.2.3, the guard self-test (91/91), the e2e (440/440) and the kill sweep (190/190) were rerun and pass. The installer mutants and the reviews below ran on 0.2.2; 0.2.3 keeps its installer code unchanged.
+
+- **Live logged-in sessions of the browser rule (0.2.3, Claude Code 2.1.311):** two `claude -p` runs in a throwaway directory with devproc installed. The prompts asked only for a screenshot of a page and its title, nothing about closing the browser.
+  - With the chrome-devtools MCP: the session closed its page, ended the browser process its MCP server had started, and checked that no Chrome was left under it before reporting. Its Chrome exited 11 s before the session ended. The machine also has a user-level instruction to close MCP browsers, which the session cited, so this run does not isolate the rule.
+  - With a headless Chrome shell script: the script used its own temporary profile, ended Chrome by that profile path in a `trap` on exit and removed the profile; the session then checked with `pgrep` that nothing was left before reporting. No user-level instruction covers this case.
+  - After uninstall, the real `settings.json`, `installed_plugins.json` and `known_marketplaces.json` were byte-identical to before.
 - **`tests/selftest.py`:** 91/91 cases pass on `plugin/scripts/guard.py` (guard code unchanged from 0.2.1 apart from its version).
 - **`tests/installer-e2e.sh`:** 440/440 checks pass, set up as for 0.2.1 below. New for 0.2.2: every former rollback check is now "exit 3, then a rerun finishes it" and "exit 3, then uninstall leaves the directory and registry as before"; kills (SIGKILL failpoints) between steps and inside file writes; first and second interrupts; a `claude` call left running holding the lock; worktree copies, repositories sharing one linked exclude file, a symlinked exclude file, a non-UTF-8 exclude line, a Latin-1 locale.
 - **`tests/installer-killsweep.sh` (new):** 190/190 checks pass. Install, upgrade and uninstall are each killed with SIGKILL before every step; each time the project's own settings and exclude patterns are intact, a rerun finishes the run, and uninstall then leaves the directory byte-identical to before with no registry record left.
 - **Installer mutants:** 106/106 caught, each by the e2e check written for it (the run stops at its first failed check, and that check must be the mutant's expected one). In the last full run 98 were caught at once; 6 were caught by an earlier check than the one named and were retargeted, and 2 (the kept marker naming its directory, and a reinstall taking its kept lines back) passed every check, so P39 got a check for each; all 8 were then caught. The 0.2.1 rollback mutants were removed with the code they tested.
 - **Fresh-context reviews of the 0.2.2 installer:** eight, with the stopping rule set before the first: stop when a review finds nothing that can lose user data, leave a state neither a rerun nor an uninstall can finish, or touch another directory or the real config. Reviews 1 to 7 found 22 issues, all fixed, each with an e2e check and a mutant. Review 8 found one low-plausibility case, accepted as a known limit: in repositories sharing one exclude file (a linked file, or a 0.2.0/0.2.1 main checkout with a worktree copy), a line a 0.2.0 or 0.2.1 uninstall kept for task data left behind is adopted by a 0.2.2 install elsewhere and removed by its uninstall; that task data is then no longer git-ignored. Check with `git status`; add `/.claude/devproc/` back by hand.
-- **Not yet repeated for 0.2.2:** the live logged-in session below (0.2.1).
+- **Not repeated since 0.2.1:** the live push test below (a fake-key push denied by the hook). The guard code is unchanged since 0.2.1 apart from its version.
 
 ### Version 0.2.1 (2026-10-25)
 
